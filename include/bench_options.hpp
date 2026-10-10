@@ -10,9 +10,9 @@
 namespace bench {
 struct Options {
     size_t a_size = size_t{32} << 30;
-    size_t b_size = size_t{1} << 30;
+    unsigned int block_size = 256;
+    unsigned int grid_size = 1024;
     uint64_t iterations = 128;
-    bool copy_back = true;
     bool validate = false;
     bool help = false;
 };
@@ -47,36 +47,52 @@ inline size_t parse_size(std::string text) {
     return static_cast<size_t>(value * factor);
 }
 
+inline unsigned int launch_dimension(const std::string& text) {
+    const uint64_t value = positive_integer(text);
+    if (value > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+        throw std::invalid_argument("launch dimension exceeds CUDA integer limits: " + text);
+    return static_cast<unsigned int>(value);
+}
+
+// Kept independent of CUDA headers so argument/limit checks are host-testable.
+inline void validate_launch_limits(const Options& options, int max_threads,
+                                  int max_block_x, int max_grid_x) {
+    if (options.block_size > static_cast<unsigned int>(max_threads) ||
+        options.block_size > static_cast<unsigned int>(max_block_x))
+        throw std::invalid_argument("block size exceeds GPU 0/kernel thread limits");
+    if (options.grid_size > static_cast<unsigned int>(max_grid_x))
+        throw std::invalid_argument("grid size exceeds GPU 0 grid limit");
+}
+
 inline Options parse_options(int argc, char** argv) {
     Options result;
     const option long_options[] = {
         {"a-size", required_argument, nullptr, 'a'},
-        {"b-size", required_argument, nullptr, 'b'},
+        {"block-size", required_argument, nullptr, 'b'},
+        {"grid-size", required_argument, nullptr, 'g'},
         {"iterations", required_argument, nullptr, 'n'},
-        {"skip-copy-back", no_argument, nullptr, 256},
         {"validate", no_argument, nullptr, 257},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
     opterr = 0;
     int c;
-    while ((c = getopt_long(argc, argv, "a:b:n:h", long_options, nullptr)) != -1) {
+    while ((c = getopt_long(argc, argv, "a:b:g:n:h", long_options, nullptr)) != -1) {
         switch (c) {
             case 'a': result.a_size = parse_size(optarg); break;
-            case 'b': result.b_size = parse_size(optarg); break;
+            case 'b': result.block_size = launch_dimension(optarg); break;
+            case 'g': result.grid_size = launch_dimension(optarg); break;
             case 'n': result.iterations = positive_integer(optarg); break;
-            case 256: result.copy_back = false; break;
             case 257: result.validate = true; break;
             case 'h': result.help = true; break;
             default: throw std::invalid_argument("unknown option or missing option argument");
         }
     }
     if (optind != argc) throw std::invalid_argument("unexpected positional argument");
-    if (result.a_size > std::numeric_limits<size_t>::max() - result.b_size)
-        throw std::invalid_argument("combined buffer size overflow");
-    if (result.validate && (result.a_size > (size_t{16} << 20) ||
-                            result.b_size > (size_t{16} << 20)))
-        throw std::invalid_argument("--validate requires A and B each <= 16 MiB");
+    if (result.a_size % sizeof(uint64_t) != 0)
+        throw std::invalid_argument("buffer A size must be a multiple of 8 bytes");
+    if (result.validate && result.a_size > (size_t{16} << 20))
+        throw std::invalid_argument("--validate requires buffer A <= 16 MiB per GPU");
     return result;
 }
 } // namespace bench

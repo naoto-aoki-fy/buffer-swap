@@ -1,10 +1,6 @@
 #include <cuda_runtime.h>
 #include <curand.h>
-#include <curand_kernel.h>
-#include <mpi.h>
-#include <nccl.h>
 
-#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -12,218 +8,201 @@
 #include <vector>
 #include <atlc/check_cuda.hpp>
 #include <atlc/check_curand.hpp>
-#include <atlc/check_mpi.hpp>
-#include <atlc/check_nccl.hpp>
 #include "bench_options.hpp"
 
 static_assert(sizeof(size_t) >= 8, "This benchmark requires 64-bit size_t");
 
 static void usage() {
     std::fprintf(stderr,
-        "Usage: gpu_comm_bench [options] (exactly two ranks on separate nodes)\n"
-        "  -a, --a-size SIZE       Main buffer bytes (default 32G)\n"
-        "  -b, --b-size SIZE       Receive buffer bytes (default 1G)\n"
+        "Usage: gpu_comm_bench [options] (one process, CUDA devices 0 and 1)\n"
+        "  -a, --a-size SIZE       Buffer A bytes per GPU (default 32G; multiple of 8)\n"
+        "  -b, --block-size N      Threads per block (default 256)\n"
+        "  -g, --grid-size N       Number of blocks (default 1024)\n"
         "  -n, --iterations N      Timed exchanges (default 128)\n"
-        "      --skip-copy-back    Leave A unchanged; omit B-to-A copies\n"
-        "      --validate          Compare every byte after each iteration; A/B <= 16M\n"
+        "      --validate          Compare both buffers after every exchange; A <= 16M\n"
         "  -h, --help              Show this help on stderr\n"
-        "SIZE is a positive integer with optional K/M/G suffix (binary units).\n");
+        "SIZE is a positive integer with optional K/M/G suffix (binary units).\n"
+        "Verify NVLink for the selected GPUs with nvidia-smi topo -m; P2P alone\n"
+        "does not establish NVLink transport. See README.md.\n");
 }
 
-// cuRAND's host API writes whole unsigned ints. Initialize a 1-3 byte tail
-// separately on the GPU so arbitrary byte sizes need no padded allocation.
-__global__ void random_tail(unsigned char* tail, size_t count,
-                            unsigned long long seed) {
-    curandState state;
-    curand_init(seed, 0, 0, &state);
-    const unsigned int value = curand(&state);
-    for (size_t i = 0; i < count; ++i)
-        tail[i] = static_cast<unsigned char>(value >> (8 * i));
-}
-
-static void initialize(unsigned char* data, size_t bytes,
-                       curandGenerator_t rng, cudaStream_t stream,
-                       unsigned long long seed) {
-    ATLC_CHECK_CURAND(curandSetPseudoRandomGeneratorSeed, rng, seed);
-    const size_t words = bytes / sizeof(unsigned int);
-    if (words)
-        ATLC_CHECK_CURAND(curandGenerate, rng,
-                         reinterpret_cast<unsigned int*>(data), words);
-    const size_t tail = bytes % sizeof(unsigned int);
-    if (tail) {
-        random_tail<<<1, 1, 0, stream>>>(data + bytes - tail, tail, seed);
-        ATLC_CHECK_CUDA(cudaGetLastError);
+__global__ void exchange(uint64_t* local, uint64_t* remote, uint64_t count) {
+    const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += stride) {
+        const uint64_t local_value = local[i];
+        const uint64_t remote_value = remote[i];
+        local[i] = remote_value;
+        remote[i] = local_value;
     }
+    // Publish stores to peer memory before this kernel completes.
+    __threadfence_system();
 }
 
-static void exchange(unsigned char* a, unsigned char* b,
-                     const bench::Options& options, int rank,
-                     ncclComm_t comm, cudaStream_t stream) {
-    for (size_t offset = 0; offset < options.a_size;) {
-        const size_t bytes = std::min(options.b_size, options.a_size - offset);
-        ATLC_CHECK_NCCL(ncclGroupStart);
-        ATLC_CHECK_NCCL(ncclSend, a + offset, bytes, ncclUint8, 1 - rank, comm, stream);
-        ATLC_CHECK_NCCL(ncclRecv, b, bytes, ncclUint8, 1 - rank, comm, stream);
-        ATLC_CHECK_NCCL(ncclGroupEnd);
-        // Stream order protects both the outgoing chunk and B before reuse.
-        if (options.copy_back)
-            ATLC_CHECK_CUDA(cudaMemcpyAsync, a + offset, b, bytes,
-                            cudaMemcpyDeviceToDevice, stream);
-        offset += bytes;
+// Own partially constructed resources too, so exceptions release allocations.
+struct Resources {
+    uint64_t* a[2] = {nullptr, nullptr};
+    cudaStream_t stream[2] = {nullptr, nullptr};
+    curandGenerator_t rng[2] = {nullptr, nullptr};
+    cudaEvent_t start = nullptr, stop = nullptr;
+    bool peer_enabled = false;
+    // Checked cleanup on successful runs; destructor handles partial failures.
+    void close() {
+        for (int device = 0; device < 2; ++device) {
+            ATLC_CHECK_CUDA(cudaSetDevice, device);
+            ATLC_CHECK_CUDA(cudaStreamSynchronize, stream[device]);
+            if (device == 0) {
+                ATLC_CHECK_CUDA(cudaEventDestroy, stop);
+                stop = nullptr;
+                ATLC_CHECK_CUDA(cudaEventDestroy, start);
+                start = nullptr;
+            }
+            ATLC_CHECK_CUDA(cudaFree, a[device]);
+            a[device] = nullptr;
+            ATLC_CHECK_CUDA(cudaStreamDestroy, stream[device]);
+            stream[device] = nullptr;
+        }
+        ATLC_CHECK_CUDA(cudaSetDevice, 0);
+        ATLC_CHECK_CUDA(cudaDeviceDisablePeerAccess, 1);
+        peer_enabled = false;
     }
+    ~Resources() {
+        for (int device = 0; device < 2; ++device) {
+            if (cudaSetDevice(device) != cudaSuccess) continue;
+            if (stream[device]) cudaStreamSynchronize(stream[device]);
+            if (rng[device]) curandDestroyGenerator(rng[device]);
+            if (device == 0) {
+                if (stop) cudaEventDestroy(stop);
+                if (start) cudaEventDestroy(start);
+            }
+            if (a[device]) cudaFree(a[device]);
+            if (stream[device]) cudaStreamDestroy(stream[device]);
+        }
+        if (peer_enabled && cudaSetDevice(0) == cudaSuccess)
+            cudaDeviceDisablePeerAccess(1);
+    }
+};
+
+static void validate(const Resources& resources, size_t bytes,
+                     const std::vector<unsigned char> (&original)[2],
+                     bool swapped, const std::string& stage) {
+    std::vector<unsigned char> actual(bytes);
+    for (int device = 0; device < 2; ++device) {
+        ATLC_CHECK_CUDA(cudaSetDevice, device);
+        ATLC_CHECK_CUDA(cudaMemcpy, actual.data(), resources.a[device], bytes,
+                       cudaMemcpyDeviceToHost);
+        if (actual != original[swapped ? 1 - device : device])
+            throw std::runtime_error("buffer A validation failed on GPU " +
+                                     std::to_string(device) + " after " + stage);
+    }
+    ATLC_CHECK_CUDA(cudaSetDevice, 0);
 }
 
 int main(int argc, char** argv) {
-    bool mpi_active = false;
-    int rank = -1;
     try {
-        ATLC_CHECK_MPI(MPI_Init, &argc, &argv);
-        mpi_active = true;
-        ATLC_CHECK_MPI(MPI_Comm_set_errhandler, MPI_COMM_WORLD, MPI_ERRORS_RETURN);
-        ATLC_CHECK_MPI(MPI_Comm_rank, MPI_COMM_WORLD, &rank);
         const auto options = bench::parse_options(argc, argv);
-        const uint64_t configuration[] = {options.a_size, options.b_size,
-            options.iterations, uint64_t(options.copy_back),
-            uint64_t(options.validate), uint64_t(options.help)};
-        uint64_t minimum[6], maximum[6];
-        ATLC_CHECK_MPI(MPI_Allreduce, configuration, minimum, 6, MPI_UINT64_T,
-                       MPI_MIN, MPI_COMM_WORLD);
-        ATLC_CHECK_MPI(MPI_Allreduce, configuration, maximum, 6, MPI_UINT64_T,
-                       MPI_MAX, MPI_COMM_WORLD);
-        if (!std::equal(minimum, minimum + 6, maximum))
-            throw std::runtime_error("all ranks must use identical command-line options");
-        if (options.help) {
-            if (rank == 0) usage();
-            ATLC_CHECK_MPI(MPI_Finalize);
-            mpi_active = false;
-            return 0;
-        }
-        int ranks;
-        ATLC_CHECK_MPI(MPI_Comm_size, MPI_COMM_WORLD, &ranks);
-        if (ranks != 2) throw std::runtime_error("exactly two MPI ranks are required");
-
-        // Reject local placement: it could silently benchmark NVLink/PCIe.
-        MPI_Comm local;
-        ATLC_CHECK_MPI(MPI_Comm_split_type, MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED,
-                       rank, MPI_INFO_NULL, &local);
-        int local_size;
-        ATLC_CHECK_MPI(MPI_Comm_size, local, &local_size);
-        ATLC_CHECK_MPI(MPI_Comm_free, &local);
-        if (local_size != 1)
-            throw std::runtime_error("place one MPI rank on each of two separate nodes");
+        if (options.help) { usage(); return 0; }
         int devices;
         ATLC_CHECK_CUDA(cudaGetDeviceCount, &devices);
-        if (!devices) throw std::runtime_error("no visible CUDA device");
-        // Ordinal is relative to CUDA_VISIBLE_DEVICES; one rank per node.
-        ATLC_CHECK_CUDA(cudaSetDevice, 0);
-        cudaDeviceProp properties;
-        ATLC_CHECK_CUDA(cudaGetDeviceProperties, &properties, 0);
-        char hostname[MPI_MAX_PROCESSOR_NAME] = {};
-        int hostname_length;
-        ATLC_CHECK_MPI(MPI_Get_processor_name, hostname, &hostname_length);
-        std::fprintf(stderr, "rank %d host %.*s CUDA device 0: %s; A=%zu B=%zu copy_back=%d\n",
-                     rank, hostname_length, hostname, properties.name,
-                     options.a_size, options.b_size, int(options.copy_back));
-
-        // Force the built-in IB verbs network and stderr logging before any
-        // NCCL call. Merely setting NCCL_IB_DISABLE=0 permits socket fallback.
-        if (setenv("NCCL_NET", "IB", 1) ||
-            setenv("NCCL_DEBUG_FILE", "/dev/stderr", 1))
-            throw std::runtime_error("failed to configure NCCL environment");
-        int nccl_version;
-        ATLC_CHECK_NCCL(ncclGetVersion, &nccl_version);
-        if (nccl_version < 21000)
-            throw std::runtime_error("NCCL 2.10 or newer is required to force the IB network");
-        ncclUniqueId id;
-        if (rank == 0) ATLC_CHECK_NCCL(ncclGetUniqueId, &id);
-        ATLC_CHECK_MPI(MPI_Bcast, &id, int(sizeof(id)), MPI_BYTE, 0, MPI_COMM_WORLD);
-        ncclComm_t comm;
-        ATLC_CHECK_NCCL(ncclCommInitRank, &comm, 2, id, rank);
-        cudaStream_t stream;
-        ATLC_CHECK_CUDA(cudaStreamCreate, &stream);
-        size_t free_bytes, total_bytes;
-        ATLC_CHECK_CUDA(cudaMemGetInfo, &free_bytes, &total_bytes);
-        if (options.a_size + options.b_size > free_bytes)
-            throw std::runtime_error("insufficient GPU memory for A+B (NCCL also needs memory)");
-        unsigned char *a, *b;
-        ATLC_CHECK_CUDA(cudaMalloc, reinterpret_cast<void**>(&a), options.a_size);
-        ATLC_CHECK_CUDA(cudaMalloc, reinterpret_cast<void**>(&b), options.b_size);
-        curandGenerator_t rng;
-        ATLC_CHECK_CURAND(curandCreateGenerator, &rng, CURAND_RNG_PSEUDO_DEFAULT);
-        ATLC_CHECK_CURAND(curandSetStream, rng, stream);
-        initialize(a, options.a_size, rng, stream, 1234ULL + rank * 2);
-        initialize(b, options.b_size, rng, stream, 1235ULL + rank * 2);
-        ATLC_CHECK_CUDA(cudaStreamSynchronize, stream);
-        ATLC_CHECK_CURAND(curandDestroyGenerator, rng);
-
-        // Establish lazy NCCL connections outside the measured iterations.
-        // Warm-up follows the chosen copy mode, so skip mode leaves A intact.
-        ATLC_CHECK_MPI(MPI_Barrier, MPI_COMM_WORLD);
-        exchange(a, b, options, rank, comm, stream);
-        ATLC_CHECK_CUDA(cudaStreamSynchronize, stream);
-
-        // Validation uses bounded host snapshots only as references. The actual
-        // exchange always uses NCCL GPU buffers, including in validation mode.
-        std::vector<unsigned char> original, peer_original, actual;
-        if (options.validate) {
-            original.resize(options.a_size);
-            peer_original.resize(options.a_size);
-            actual.resize(options.a_size);
-            ATLC_CHECK_CUDA(cudaMemcpy, original.data(), a, options.a_size,
-                           cudaMemcpyDeviceToHost);
-            ATLC_CHECK_MPI(MPI_Sendrecv, original.data(), int(options.a_size), MPI_BYTE,
-                           1 - rank, 0, peer_original.data(), int(options.a_size), MPI_BYTE,
-                           1 - rank, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        if (devices < 2) throw std::runtime_error("two visible CUDA GPUs are required");
+        cudaDeviceProp properties[2];
+        for (int device = 0; device < 2; ++device) {
+            ATLC_CHECK_CUDA(cudaGetDeviceProperties, &properties[device], device);
+            if (!properties[device].unifiedAddressing)
+                throw std::runtime_error("both GPUs must support unified virtual addressing");
+            char bus_id[32];
+            ATLC_CHECK_CUDA(cudaDeviceGetPCIBusId, bus_id, sizeof(bus_id), device);
+            std::fprintf(stderr, "CUDA device %d: %s, PCI bus %s, memory=%zu bytes\n",
+                         device, properties[device].name, bus_id,
+                         properties[device].totalGlobalMem);
         }
-        cudaEvent_t start, stop;
-        ATLC_CHECK_CUDA(cudaEventCreate, &start);
-        ATLC_CHECK_CUDA(cudaEventCreate, &stop);
-        if (rank == 0)
-            std::printf("iteration,buffer_a_bytes,buffer_b_bytes,copy_back,elapsed_ms\n");
-        for (uint64_t iteration = 0; iteration < options.iterations; ++iteration) {
-            ATLC_CHECK_MPI(MPI_Barrier, MPI_COMM_WORLD);
-            ATLC_CHECK_CUDA(cudaEventRecord, start, stream);
-            exchange(a, b, options, rank, comm, stream);
-            ATLC_CHECK_CUDA(cudaEventRecord, stop, stream);
-            ATLC_CHECK_CUDA(cudaEventSynchronize, stop);
-            float elapsed_ms, max_ms = 0;
-            ATLC_CHECK_CUDA(cudaEventElapsedTime, &elapsed_ms, start, stop);
-            ATLC_CHECK_MPI(MPI_Reduce, &elapsed_ms, &max_ms, 1, MPI_FLOAT,
-                           MPI_MAX, 0, MPI_COMM_WORLD);
+        bench::validate_launch_limits(options, properties[0].maxThreadsPerBlock,
+                                     properties[0].maxThreadsDim[0],
+                                     properties[0].maxGridSize[0]);
+        ATLC_CHECK_CUDA(cudaSetDevice, 0);
+        cudaFuncAttributes attributes;
+        ATLC_CHECK_CUDA(cudaFuncGetAttributes, &attributes, exchange);
+        bench::validate_launch_limits(options, attributes.maxThreadsPerBlock,
+                                     properties[0].maxThreadsDim[0],
+                                     properties[0].maxGridSize[0]);
+        int accessible;
+        ATLC_CHECK_CUDA(cudaDeviceCanAccessPeer, &accessible, 0, 1);
+        if (!accessible)
+            throw std::runtime_error("GPU 0 cannot directly access GPU 1 memory via CUDA P2P");
+        std::fprintf(stderr,
+            "Transport: CUDA P2P; NVLink UNVERIFIED. CUDA P2P may use PCIe.\n"
+            "Only label these results NVLink after checking the selected PCI bus IDs\n"
+            "against nvidia-smi topo -m (NV# link); see README.md.\n"
+            "A=%zu bytes per GPU, block=%u, grid=%u, iterations=%" PRIu64 "\n",
+            options.a_size, options.block_size, options.grid_size, options.iterations);
+        Resources resources;
+        ATLC_CHECK_CUDA(cudaDeviceEnablePeerAccess, 1, 0);
+        resources.peer_enabled = true;
+        std::vector<unsigned char> original[2];
+        for (int device = 0; device < 2; ++device) {
+            ATLC_CHECK_CUDA(cudaSetDevice, device);
+            ATLC_CHECK_CUDA(cudaStreamCreate, &resources.stream[device]);
+            ATLC_CHECK_CURAND(curandCreateGenerator, &resources.rng[device],
+                             CURAND_RNG_PSEUDO_DEFAULT);
+            ATLC_CHECK_CURAND(curandSetStream, resources.rng[device], resources.stream[device]);
+            size_t free_bytes, total_bytes;
+            ATLC_CHECK_CUDA(cudaMemGetInfo, &free_bytes, &total_bytes);
+            if (options.a_size > free_bytes)
+                throw std::runtime_error("insufficient free memory for buffer A on GPU " +
+                                         std::to_string(device));
+            ATLC_CHECK_CUDA(cudaMalloc, reinterpret_cast<void**>(&resources.a[device]),
+                           options.a_size);
+            ATLC_CHECK_CURAND(curandSetPseudoRandomGeneratorSeed,
+                             resources.rng[device], 1234ULL + device);
+            ATLC_CHECK_CURAND(curandGenerate, resources.rng[device],
+                             reinterpret_cast<unsigned int*>(resources.a[device]),
+                             options.a_size / sizeof(unsigned int));
+            ATLC_CHECK_CUDA(cudaStreamSynchronize, resources.stream[device]);
+            ATLC_CHECK_CURAND(curandDestroyGenerator, resources.rng[device]);
+            resources.rng[device] = nullptr;
             if (options.validate) {
-                ATLC_CHECK_CUDA(cudaMemcpy, actual.data(), a, options.a_size,
-                               cudaMemcpyDeviceToHost);
-                const auto& expected = options.copy_back && iteration % 2 == 0
-                                       ? peer_original : original;
-                if (actual != expected)
-                    throw std::runtime_error("buffer A validation failed at iteration " +
-                                             std::to_string(iteration));
-                ATLC_CHECK_MPI(MPI_Barrier, MPI_COMM_WORLD);
+                original[device].resize(options.a_size);
+                ATLC_CHECK_CUDA(cudaMemcpy, original[device].data(), resources.a[device],
+                               options.a_size, cudaMemcpyDeviceToHost);
             }
-            if (rank == 0) {
-                if (std::printf("%" PRIu64 ",%zu,%zu,%d,%.3f\n", iteration,
-                                options.a_size, options.b_size,
-                                int(options.copy_back), double(max_ms)) < 0 ||
-                    std::fflush(stdout) != 0)
-                    throw std::runtime_error("failed to write CSV output");
-            }
+        }
+        ATLC_CHECK_CUDA(cudaSetDevice, 0);
+        const cudaStream_t stream = resources.stream[0];
+        const uint64_t count = options.a_size / sizeof(uint64_t);
+        ATLC_CHECK_CUDA(cudaEventCreate, &resources.start);
+        ATLC_CHECK_CUDA(cudaEventCreate, &resources.stop);
+        exchange<<<options.grid_size, options.block_size, 0, stream>>>(
+            resources.a[0], resources.a[1], count);
+        ATLC_CHECK_CUDA(cudaGetLastError);
+        ATLC_CHECK_CUDA(cudaStreamSynchronize, stream);
+        bool swapped = true; // One full warm-up swap, checked against initial data.
+        if (options.validate) validate(resources, options.a_size, original, swapped, "warm-up");
+        if (std::printf("iteration,buffer_a_bytes,block_size,grid_size,elapsed_ms\n") < 0)
+            throw std::runtime_error("failed to write CSV header");
+        for (uint64_t iteration = 0; iteration < options.iterations; ++iteration) {
+            ATLC_CHECK_CUDA(cudaEventRecord, resources.start, stream);
+            exchange<<<options.grid_size, options.block_size, 0, stream>>>(
+                resources.a[0], resources.a[1], count);
+            ATLC_CHECK_CUDA(cudaGetLastError);
+            ATLC_CHECK_CUDA(cudaEventRecord, resources.stop, stream);
+            ATLC_CHECK_CUDA(cudaEventSynchronize, resources.stop);
+            float elapsed_ms;
+            ATLC_CHECK_CUDA(cudaEventElapsedTime, &elapsed_ms, resources.start, resources.stop);
+            swapped = !swapped;
+            if (options.validate)
+                validate(resources, options.a_size, original, swapped,
+                         "iteration " + std::to_string(iteration));
+            if (std::printf("%" PRIu64 ",%zu,%u,%u,%.6f\n", iteration,
+                            options.a_size, options.block_size, options.grid_size,
+                            double(elapsed_ms)) < 0 || std::fflush(stdout) != 0)
+                throw std::runtime_error("failed to write CSV output");
         }
         if (options.validate)
-            std::fprintf(stderr, "rank %d: byte-for-byte validation passed\n", rank);
-        ATLC_CHECK_CUDA(cudaEventDestroy, stop);
-        ATLC_CHECK_CUDA(cudaEventDestroy, start);
-        ATLC_CHECK_NCCL(ncclCommDestroy, comm);
-        ATLC_CHECK_CUDA(cudaFree, b);
-        ATLC_CHECK_CUDA(cudaFree, a);
-        ATLC_CHECK_CUDA(cudaStreamDestroy, stream);
-        ATLC_CHECK_MPI(MPI_Finalize);
-        mpi_active = false;
+            std::fprintf(stderr, "byte-for-byte validation passed on both GPUs (warm-up and all iterations)\n");
+        resources.close();
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "rank %d: %s\n", rank, error.what());
-        // A peer may be blocked in NCCL or a collective. Abort the whole job;
-        // attempting stream/resource cleanup here can itself deadlock.
-        if (mpi_active) MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        std::fprintf(stderr, "error: %s\n", error.what());
         return EXIT_FAILURE;
     }
 }

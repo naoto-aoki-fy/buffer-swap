@@ -1,231 +1,192 @@
-# GPU communication benchmark
+# CUDA GPU buffer exchange benchmark
 
-`bin/gpu_comm_bench` is a two-rank GPU communication benchmark for separate
-compute nodes connected by InfiniBand. Each rank owns a main GPU buffer A and a
-smaller receive buffer B. Consecutive chunks of A are sent to the peer using
-grouped `ncclSend`/`ncclRecv`; received chunks are copied from B into A on the
-same CUDA stream. The final chunk can be smaller than B. Only these two data
-buffers are allocated, using `cudaMalloc` and initialized with cuRAND.
+`bin/gpu_comm_bench` runs one process managing CUDA devices 0 and 1 on a
+single computer. GPU 0 launches a kernel that exchanges its buffer A with
+GPU 1's buffer A using direct CUDA P2P loads and stores. Each thread reads
+both 64-bit values before writing either, then advances by the grid's total
+thread count. Indices and strides are 64-bit. Each element has one owner;
+no atomics or inter-thread barriers are needed. A system memory fence at the
+end of each thread publishes peer writes before kernel completion.
+
+One `cudaMalloc` buffer per GPU is initialized with cuRAND using independent
+seeds. There is no receive buffer, host-staged payload, MPI, NCCL, or
+InfiniBand communication. The default is **32 GiB (34,359,738,368 bytes) per
+GPU**, requiring that much free memory plus CUDA/cuRAND overhead.
 
 ## Build
 
-Use the existing Makefile, `nvcc`,
+Keep the existing Makefile, `nvcc`,
 [`atlc`](https://github.com/naoto-aoki-fy/atlc), and
-[`nvccoptions`](https://github.com/naoto-aoki-fy/nvccoptions) workflow. Requirements
-are a 64-bit Linux system, CUDA toolkit, MPI supporting MPI-3 shared-node
-communicators, and NCCL **2.10 or newer** (for forced IB network selection).
-Error-checking macros from `atlc` check CUDA, cuRAND, MPI and NCCL calls.
+[`nvccoptions`](https://github.com/naoto-aoki-fy/nvccoptions) workflow.
+Requirements are 64-bit Linux, a CUDA toolkit supporting your GPUs, and the
+`atlc` headers. The CUDA and cuRAND calls use `ATLC_CHECK_CUDA` and
+`ATLC_CHECK_CURAND`. The application links CUDA runtime and cuRAND only.
 
-Load your site's CUDA, NCCL and MPI modules and set up `atlc`'s include path.
-Obtain the vendor/compiler options with `nvccoptions` as in the original build,
-and put them in the automatically included `config.mk`. For example, replacing
-all paths and architecture values with those for your installation:
+Generate compiler options with your existing `nvccoptions` installation:
+
+```bash
+cd /path/to/nvccoptions
+./get_nvccopts.sh
+```
+
+The helper discovers NVIDIA HPC SDK wrapper options and caches them in
+`nvccoptions.txt`. Its discovery step uses `mpicxx`; that is a tooling
+requirement of the existing helper, not a runtime or link dependency of this
+benchmark. Review the generated options, retain the CUDA/platform compiler
+and linker flags, and remove MPI/NCCL include paths, library paths, libraries
+(including `-lmpi` and `-lnccl`), and wrapper-specific MPI flags. Put the
+remaining options into this repository's `config.mk`, which the Makefile
+continues to include automatically. For example, adapting paths and GPU
+architecture to your installation:
 
 ```make
-CFLAGS_VENDOR = -I/path/to/atlc/include -I/path/to/mpi/include -I/path/to/nccl/include
-LDFLAGS_VENDOR = -L/path/to/mpi/lib -lmpi -L/path/to/nccl/lib
+CFLAGS_VENDOR = -I/path/to/atlc/include
+LDFLAGS_VENDOR = -L/path/to/cuda/lib64
 GENCODE_FLAGS = -gencode=arch=compute_80,code=sm_80
 ```
 
-Use the complete MPI wrapper compile/link flags for your MPI implementation;
-for Open MPI these can be inspected with `mpicxx --showme:compile` and
-`mpicxx --showme:link`. Include any extra platform libraries supplied by the
-wrapper in the vendor flags. Ensure these flags select the same MPI that
-`mpirun` uses. Set runtime library paths for MPI, NCCL and CUDA through your
-site modules or `LD_LIBRARY_PATH`.
+Then, from this repository:
 
 ```bash
 make
 ```
 
-The default target builds `bin/gpu_comm_bench` directly with `nvcc`, linking
-cuRAND and NCCL plus the MPI flags in `LDFLAGS_VENDOR`. `NVCC`, `INCLUDE`,
-`LDLIBS` and `BENCH_BIN` remain overridable. No CMake or generated argument
-parser is required. `make clean` removes the benchmark executable.
+The executable remains `bin/gpu_comm_bench`. `NVCC`, `INCLUDE`, `LDLIBS`, and
+`BENCH_BIN` remain overridable; default `LDLIBS` is `-lcurand`. Set CUDA runtime
+library paths through your site modules or `LD_LIBRARY_PATH`.
+`make clean` removes the executable. No additional build system is used.
 
-## Options
+## Hardware and NVLink verification
+
+Expose two GPUs on the same machine. The program selects visible CUDA
+ordinals 0 and 1, requires unified virtual addressing, checks
+`cudaDeviceCanAccessPeer(0, 1)`, and enables GPU 0 access to GPU 1 with
+`cudaDeviceEnablePeerAccess(1, 0)`. Only GPU 0 runs the exchange kernel, so
+reverse peer access is unnecessary. Both GPUs' initialization streams
+finish before any exchange starts. Launch sizes are checked against GPU 0's
+device and kernel limits; insufficient free device memory fails with an
+error on stderr.
+
+**CUDA P2P accessibility does not prove NVLink transport.** Before collecting
+NVLink results, run:
+
+```bash
+nvidia-smi --query-gpu=index,name,pci.bus_id --format=csv
+nvidia-smi topo -m
+```
+
+Match the PCI bus IDs printed by the benchmark on stderr to the physical GPUs
+in the topology matrix. The intersection for those GPUs should show `NV#`
+(e.g. `NV2`), indicating a bonded set of NVLinks. PCIe topology labels such as
+`PIX`, `PXB`, `PHB`, or `SYS` are not NVLink confirmation. See NVIDIA's
+[`nvidia-smi` topology reference](https://docs.nvidia.com/deploy/nvidia-smi/index.html).
+`CUDA_VISIBLE_DEVICES` can reorder visible CUDA ordinals, so do not assume
+CUDA device 0 is physical GPU index 0.
+
+This program does not automatically detect the physical transport. Every
+run explicitly logs **NVLink UNVERIFIED** and warns that P2P may use PCIe.
+Treat results as generic CUDA P2P measurements until the selected pair's
+NVLink topology is verified, and keep that topology output alongside the CSV
+and diagnostics. A PCIe P2P run is not an NVLink result. No host fallback is
+implemented; lack of CUDA P2P causes failure. CUDA's
+[peer memory access documentation](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/index.html#peer-to-peer-memory-access)
+describes the hardware-dependent support.
+
+## Options and execution
 
 | Option | Meaning | Default |
 |---|---|---|
-| `-a`, `--a-size SIZE` | A size in bytes | `32G` (32 GiB) |
-| `-b`, `--b-size SIZE` | B size in bytes | `1G` (1 GiB) |
-| `-n`, `--iterations N` | Number of timed full-A exchanges | `128` |
-| `--skip-copy-back` | Omit B-to-A device copies; A remains unchanged | Disabled |
-| `--validate` | Compare every byte of A after each timed iteration | Disabled |
-| `-h`, `--help` | Print help to stderr and exit | |
+| `-a`, `--a-size SIZE` | Buffer A bytes on each GPU; multiple of 8 | `32G` |
+| `-b`, `--block-size N` | CUDA threads per block | `256` |
+| `-g`, `--grid-size N` | CUDA number of blocks | `1024` |
+| `-n`, `--iterations N` | Number of timed full exchanges | `128` |
+| `--validate` | Compare every byte of both buffers after each exchange | Disabled |
+| `-h`, `--help` | Print help on stderr and exit before CUDA setup | |
 
-Sizes are positive decimal integers with optional case-insensitive `K`, `M`
-or `G` suffixes, representing powers of 1024. Bare numbers mean bytes. Signs,
-fractions, zero, overflow and extra positional arguments are rejected. Sizes
-need not be multiples of four or of each other; B may be larger than A.
-Iterations must be positive decimal integers. All ranks must use identical
-options. `--validate` limits each buffer to 16 MiB to keep host reference
-storage bounded. The default buffers require **33 GiB free GPU memory per
-rank plus CUDA/cuRAND/NCCL overhead**; reduce the sizes for smaller GPUs.
-Allocation errors and insufficient memory abort the MPI job.
+Sizes use positive decimal integers with optional case-insensitive `K`, `M`,
+or `G` binary suffixes; bare numbers mean bytes. Signs, whitespace, fractions,
+zero, overflow, unaligned sizes, missing arguments, and positional arguments
+are rejected. Launch sizes and iteration count must be positive decimal
+integers. Launch dimensions must fit CUDA's integer limits and the selected
+GPU/kernel limits. Validation requires A <= 16 MiB on each GPU to bound host
+reference memory. `-b` now means block size; `--b-size` and
+`--skip-copy-back` are removed.
 
-## Launch on two nodes
-
-Run exactly two MPI ranks, with **one rank per node**. The program rejects
-same-node placement to avoid measuring NVLink or PCIe. Each rank selects CUDA
-device ordinal 0 relative to its `CUDA_VISIBLE_DEVICES` setting; let your
-scheduler expose the assigned GPU, or set the appropriate visibility per node.
-MPI broadcasts the NCCL unique ID. All benchmark payload transfers use NCCL
-on GPU buffers; MPI handles setup, barriers and time reductions.
-
-For a scheduler allocation already placing one process on each node:
+Run directly, without an MPI launcher:
 
 ```bash
-mpirun -np 2 ./bin/gpu_comm_bench \
-    --a-size 32G \
-    --b-size 1G \
-    --iterations 128 \
-    > results.csv
+./bin/gpu_comm_bench -a 32G -b 256 -g 1024 -n 128 > results.csv 2> diagnostics.log
+# Smaller allocations, selecting two physical GPUs if necessary:
+CUDA_VISIBLE_DEVICES=0,1 ./bin/gpu_comm_bench -a 1G -n 16 > small.csv 2> small.log
 ```
-
-An Open MPI example explicitly placing processes on two allocated nodes is:
-
-```bash
-mpirun -np 2 --host node-a,node-b --map-by ppr:1:node \
-    -x NCCL_IB_HCA -x NCCL_IB_DISABLE -x NCCL_DEBUG -x NCCL_DEBUG_SUBSYS \
-    ./bin/gpu_comm_bench -a 32G -b 1G -n 128 > results.csv 2> diagnostics.log
-```
-
-Set the exported variables as described below before using this command.
-For Slurm, request two nodes, one task and one GPU per node, for example
-`#SBATCH --nodes=2`, `#SBATCH --ntasks-per-node=1`, and
-`#SBATCH --gpus-per-node=1`, then use your site's supported MPI launch command
-(e.g. `srun --mpi=pmix -n 2 --ntasks-per-node=1 ./bin/gpu_comm_bench ...`).
-PMIx/PMI selection, GPU binding, CPU binding, HCA selection and module names
-are site-specific; use the cluster's MPI and GPU allocation instructions.
-Do not launch outside an allocation on systems that require one.
-
-## Require and verify InfiniBand
-
-The program sets `NCCL_NET=IB` before the first NCCL call, overriding any
-inherited setting. This forces NCCL's built-in IB verbs network rather than
-allowing TCP socket fallback. It also sets `NCCL_DEBUG_FILE=/dev/stderr`,
-overriding inherited log destinations, so NCCL diagnostics cannot pollute CSV
-stdout. External network plugins with other names are not supported by this
-benchmark. These settings require NCCL 2.10+.
-
-On **both** compute nodes, confirm that the intended HCA/port is active and
-its link layer is InfiniBand (for example, with `ibstat` or `ibv_devinfo`).
-IB verbs can also operate over RoCE; `NCCL_NET=IB` alone does not prove that
-the physical link is InfiniBand. Configure matching, reachable HCAs on the
-fabric, for example:
-
-```bash
-export NCCL_IB_DISABLE=0
-export NCCL_IB_HCA='=mlx5_0:1'   # Replace with the actual adapter and port
-export NCCL_DEBUG=INFO
-export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH
-```
-
-Forward these settings to both MPI processes using your launcher's environment
-mechanism. HCA names may differ between nodes; use per-node settings where
-necessary. IP interfaces selected by `NCCL_SOCKET_IFNAME` are used for
-bootstrap connectivity and do not force the GPU data transport to IB.
-NCCL and MPI can use bootstrap/control sockets even when payloads use IB.
-
-Inspect `diagnostics.log` from both ranks for network selection and actual
-channel connections using `NET/IB`, the intended HCA/port, and GPUDirect RDMA
-indications such as `GDRDMA` (wording varies by NCCL version). Reject results
-showing data channels using `NET/Socket`, `P2P`, or `SHM`. Seeing an HCA in an
-initialization message alone is insufficient; check the actual channel paths.
-A forced-IB run should fail if the required IB transport is unavailable;
-verify the failure behavior on your installation before collecting results.
-
-For direct GPU-to-GPU RDMA, the system must support GPUDirect RDMA, with the
-site's supported `nvidia-peermem` or DMA-BUF setup, GPU/HCA topology and memory
-registration configuration. Confirm GDR use in channel logs; IB without GDR
-can involve NCCL-internal host staging and is not an intended direct-RDMA
-measurement. The application itself never stages benchmark payloads through
-host memory. Administrators may require topology-specific NCCL GDR settings;
-use their validated configuration rather than assuming every GPU/HCA pair
-supports direct RDMA.
-
-See NVIDIA's [NCCL environment variable reference](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html)
-and [GPUDirect RDMA troubleshooting guide](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting.html#gpu-direct)
-for network selection, logging, HCA filters and prerequisites.
 
 ## Timing and CSV
 
-Allocation, cuRAND initialization, communicator setup and one untimed full-A
-warm-up exchange run before timing. The warm-up follows the chosen copy mode;
-in normal mode it swaps A once. Each timed iteration synchronizes ranks with
-an MPI barrier, then records start and stop CUDA events on the single stream
-around the entire chunk loop. The stop event is synchronized before reading
-`cudaEventElapsedTime`. MPI reduces the two local event times with `MPI_MAX`
-after the stop event; rank 0 reports that maximum in milliseconds.
+Allocation, initialization, reference snapshots, and one complete untimed
+warm-up exchange precede timing. Each timed iteration records a start CUDA
+event on GPU 0's exchange stream, launches the entire swap kernel, records a
+stop event on that same stream, synchronizes the stop event, and obtains
+milliseconds using `cudaEventElapsedTime`. The measured execution includes
+remote P2P memory access and the final system memory fence. Validation runs
+after synchronization and outside the measured interval. Every iteration
+performs a complete exchange, so contents alternate, including the warm-up.
 
-Normal mode includes NCCL communication and all B-to-A device copies, leaving
-A equal to the peer's A from the beginning of that iteration. Successive
-iterations alternate the two contents. `--skip-copy-back` includes only NCCL
-communication: each chunk is received into B and overwritten by the next,
-while A remains unchanged. A full iteration sends A bytes and receives A bytes
-per rank in both modes. Timings cover execution on the stream, including
-waiting and any gaps in enqueueing; they are not isolated link latency or
-MPI wall-clock timings. Diagnostic logging can affect measurements, so use
-INFO to verify the transport, then lower verbosity for production runs.
-
-Only rank 0 writes stdout, with one header and one row per timed iteration:
+Stdout contains only this header and one row per timed iteration:
 
 ```csv
-iteration,buffer_a_bytes,buffer_b_bytes,copy_back,elapsed_ms
-0,34359738368,1073741824,1,1234.567
-1,34359738368,1073741824,1,1231.234
+iteration,buffer_a_bytes,block_size,grid_size,elapsed_ms
+0,34359738368,256,1024,1234.567000
+1,34359738368,256,1024,1231.234000
 ```
 
-These elapsed values are illustrative. Iteration numbering starts at zero;
-`copy_back` is `1` normally and `0` in skip mode. Help, configuration, errors,
-validation messages and NCCL logs go to stderr. Redirect stdout directly to
-CSV and stderr to a diagnostics file.
+Times above are illustrative. Iterations start at zero. Help, configuration,
+GPU identities, topology warnings, validation, and errors go to stderr.
+Timings describe this load/store exchange kernel, not isolated NVLink latency
+or peak link bandwidth.
 
-## Validation
+## Tests and validation
 
-`--validate` snapshots each rank's post-warm-up A on the host and exchanges
-bounded reference snapshots with MPI outside timing. After every timed
-iteration it compares all bytes of A to the expected peer snapshot (odd
-exchange count) or local snapshot (even exchange count). Skip mode always
-compares against the local snapshot. Validation copies and comparisons are
-outside the CUDA-event interval and allocate no extra GPU data buffer.
-Any mismatch aborts the job; successful checks are reported on stderr.
-
-On an allocated two-node GPU/InfiniBand system, run these examples with the
-same placement and NCCL settings as above:
-
-```bash
-# Multiple chunks, an odd byte count, and a partial final chunk; test both parities.
-mpirun -np 2 --host node-a,node-b --map-by ppr:1:node \
-    ./bin/gpu_comm_bench -a 1003 -b 257 -n 3 --validate > validate-copy.csv
-mpirun -np 2 --host node-a,node-b --map-by ppr:1:node \
-    ./bin/gpu_comm_bench -a 1003 -b 257 -n 3 --validate --skip-copy-back > validate-skip.csv
-# Exact chunks, B larger than A, and sub-word cuRAND initialization.
-mpirun -np 2 --host node-a,node-b --map-by ppr:1:node \
-    ./bin/gpu_comm_bench -a 1024 -b 256 -n 2 --validate > validate-exact.csv
-mpirun -np 2 --host node-a,node-b --map-by ppr:1:node \
-    ./bin/gpu_comm_bench -a 3 -b 7 -n 2 --validate > validate-tiny.csv
-```
-
-Check that each output has the exact CSV header, the requested number of
-rows and five fields per row. Also check that one/three ranks, two ranks on
-a single node, conflicting rank options and excessive allocation requests
-fail with diagnostics on stderr. Test invalid options and `--help` without a
-GPU; help should leave stdout empty.
-
-Host-only option tests can run without CUDA or MPI:
+Host-only parser tests require no CUDA installation:
 
 ```bash
 g++ -std=c++17 -Wall -Wextra -Werror -Iinclude tests/bench_options_test.cpp -o /tmp/bench_options_test
 /tmp/bench_options_test
 ```
 
-They cover defaults, binary suffixes, arbitrary byte sizes, copy mode,
-validation bounds, invalid options, missing arguments, unsigned integer
-limits, size multiplication overflow and combined allocation overflow.
-GPU correctness, timing and transport verification require the actual
-CUDA/NCCL/MPI and two-node InfiniBand environment.
+They test defaults, short/long options, binary suffixes, integer/size overflow,
+alignment, validation bounds, removed options, and device launch limit checks.
+Help and invalid options can also run without GPU hardware once the CUDA
+executable has been built (the shared CUDA libraries must still be present).
+
+On a two-GPU CUDA P2P system, build and run the integration suite:
+
+```bash
+python3 tests/gpu_bench_test.py ./bin/gpu_comm_bench
+```
+
+It checks CLI behavior, stderr diagnostics, exact CSV fields and row counts,
+nonnegative finite elapsed times, and full
+correctness with one through four timed exchanges. Sizes include one 64-bit
+element, a grid-stride tail, a single-thread loop, and a larger small buffer.
+Validation snapshots both initial buffers, checks the warm-up against the
+opposite snapshots, then checks both buffers after every timed exchange.
+With one warm-up, an odd number of timed exchanges restores the initial
+contents; an even number leaves them swapped. Validation failure returns a
+nonzero status and reports the GPU and exchange on stderr. Host snapshots
+are references only and never carry the actual exchange payload.
+
+Individual parity checks:
+
+```bash
+./bin/gpu_comm_bench -a 1000 -b 3 -g 7 -n 3 --validate > odd.csv 2> odd.log
+./bin/gpu_comm_bench -a 1000 -b 3 -g 7 -n 4 --validate > even.csv 2> even.log
+```
+
+The integration suite requires real GPUs; it does not prove NVLink transport.
+Also verify NVLink topology as above and run the default 32 GiB configuration
+on a pair with sufficient free memory before collecting production results.
+GPU correctness, launch behavior, P2P visibility, and event timing cannot be
+verified by the host-only parser suite.
 
 ## Acknowledgments
 
