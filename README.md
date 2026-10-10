@@ -372,3 +372,227 @@ the actual CUDA toolkit and two-GPU hardware; host tests cannot verify them.
 This repository is based on results obtained from a project, JPNP20017,
 commissioned by the New Energy and Industrial Technology Development
 Organization (NEDO).
+
+## Two-node NVSHMEM GPU buffer-swap benchmark
+
+`bin/nvshmem_swap_bench` is an additional executable that exchanges all of A
+between exactly two GPUs on separate nodes. MPI handles setup, iteration
+barriers, and timing aggregation. All measured payload transfers and peer
+notifications use GPU-side NVSHMEM. The existing benchmark sources and default
+build target are unchanged.
+
+### Build and configuration
+
+Use the same `nvcc`, `nvccoptions`, `atlc`, Makefile and `config.mk` workflow.
+Requirements are 64-bit Linux, CUDA/cuRAND, MPI with shared-node communicators,
+a compatible NVSHMEM installation providing `nvshmemx_getmem_block`,
+`nvshmemx_signal_op`, MPI interoperability and collective launch, and an active
+InfiniBand fabric. Use a recent NVSHMEM release with the split host/device
+libraries (e.g. 2.8 or later), built with MPI bootstrap and IBRC support. Match
+its supported CUDA/driver versions. GPUs must be Volta or newer, support CUDA
+cooperative launch, and be exclusively allocated to these processes.
+
+For example, add these site-specific settings to `config.mk`:
+
+```make
+CFLAGS_VENDOR = -I/path/to/atlc/include -I/path/to/mpi/include
+GENCODE_FLAGS = -gencode=arch=compute_80,code=sm_80
+NVSHMEM_HOME = /path/to/nvshmem
+NVSHMEM_MPI_LDFLAGS = -L/path/to/mpi/lib -lmpi
+# Defaults below can be overridden for lib64 or additional vendor libraries:
+NVSHMEM_CFLAGS = -I$(NVSHMEM_HOME)/include -rdc=true
+NVSHMEM_LDFLAGS = -L$(NVSHMEM_HOME)/lib
+NVSHMEM_LDLIBS = -lnvshmem_host -lnvshmem_device -lcurand
+```
+
+Supply the complete compile/link flags from your MPI wrapper, and any
+installation-specific NVSHMEM dependencies (such as `-lmlx5` if required by
+that build). Obtain compiler flags using `nvccoptions` as usual. The single
+`nvcc` invocation with `-rdc=true` compiles and device-links the kernel against
+`libnvshmem_device.a`; retain this flag when overriding `NVSHMEM_CFLAGS`.
+The target reuses `NVCC_CFLAGS`, but uses separate NVSHMEM/MPI library settings
+rather than `LDLIBS` or `LDFLAGS_VENDOR`, avoiding an NCCL link dependency.
+NVSHMEM-specific flags apply only to this target. Set runtime library paths
+for CUDA, MPI, NVSHMEM and its bootstrap/transport plugins using modules or
+`LD_LIBRARY_PATH` on both nodes. MPI must match the NVSHMEM MPI bootstrap build.
+
+```bash
+make bin/nvshmem_swap_bench
+```
+
+`NVSHMEM_BIN` overrides the executable path; `make clean` removes it too.
+See NVIDIA's [NVSHMEM compilation and MPI interoperability guide](https://docs.nvidia.com/nvshmem/api/latest/using.html).
+
+### Memory and options
+
+| Option | Meaning | Default |
+|---|---|---|
+| `-a`, `--a-size SIZE` | A bytes per GPU | `32G` (32 GiB) |
+| `-e`, `--element-bytes N` | Bytes assigned to each copying thread; 1, 2, 4 or 8 | `8` |
+| `-t`, `--block-size N` | CUDA threads per block | `256` |
+| `-m`, `--sm-multiplier N` | Multiplier of the GPU SM count | `1` |
+| `-n`, `--iterations N` | Timed complete swaps | `128` |
+| `--validate` | Verify warm-up and every timed swap, both ranks | Disabled |
+| `-h`, `--help` | Usage on stderr, without CUDA/NVSHMEM initialization | |
+
+Positive decimal sizes use the existing binary K/M/G suffix convention.
+Arbitrary byte sizes are accepted, including a tail smaller than one element.
+The element size controls chunk size and per-thread byte-copy work; it does
+not impose divisibility on A. Signs, zero, fractions, overflow, unsupported
+widths and positional arguments fail. Validation limits A to 16 MiB.
+
+The launch grid is exactly `SM_count * sm_multiplier`. Both ranks must agree
+on all options and have equal SM counts, ensuring matching block ownership
+and round counts. The executable checks CUDA block/grid limits and each GPU's
+NVSHMEM collective-launch capacity. An unsupported multiplier fails instead
+of oversubscribing waiting blocks; reduce it or the block size.
+
+A and B are symmetric GPU allocations, with B exactly
+`element_bytes * block_size * grid_blocks` bytes. One symmetric 64-bit signal
+is allocated per block. B is symmetric so that the IBRC GET destination is
+registered GPU memory; no separate registration or host staging is needed.
+A uses different cuRAND seeds on the two ranks, with a cuRAND device kernel
+initializing any trailing bytes outside whole 32-bit words.
+
+This implementation forces `NVSHMEM_DISABLE_CUDA_VMM=1` and uses a static
+CUDA-backed symmetric heap. Before NVSHMEM initialization, it checks that
+`NVSHMEM_SYMMETRIC_SIZE` holds A+B+signals plus a conservative 1 MiB reserve
+and fits in free GPU memory. Allocation failure remains fatal because runtime
+resources and alignment can require more space. The accepted heap setting
+uses the same integer K/M/G notation and is normalized to bytes; if unset,
+1 GiB is assumed. Set it explicitly for production runs:
+
+```bash
+export NVSHMEM_SYMMETRIC_SIZE=33G
+```
+
+For the default A, this provides room beyond 32 GiB for B, signals and runtime
+allocations. Each GPU needs free memory for the **entire configured heap**,
+plus CUDA, cuRAND and NVSHMEM overhead; a 32 GiB GPU cannot run the default.
+Larger block counts can require a larger heap. Excessive sizes and signal
+counter overflow are rejected before launching the swap kernel.
+
+### Algorithm and synchronization
+
+Block `b` owns B at `b * chunk_bytes` and processes A at
+`(r * grid_blocks + b) * chunk_bytes` for successive rounds `r`, inside one
+kernel invocation. Chunks never overlap; blocking `nvshmemx_getmem_block`
+fetches only the remaining bytes of a partial final chunk, with every thread
+participating. After a block barrier, thread 0 completes outstanding operations,
+signals the peer's corresponding block with a generation counter, drains the
+signal, and waits for the peer's counter to reach that generation. Only then
+do all threads copy their assigned bytes from B into A. A block barrier
+completes the copy before reusing B.
+
+Counters use a distinct range for each swap, including warm-up, and are never
+reset between iterations. Signal completion prevents an older SET arriving
+after a newer SET. The peer notification proves its original-data GET is
+complete before A is overwritten. Blocks advance independently through disjoint
+chunks. System fences publish the local A writes before kernel completion and
+the next iteration's MPI barrier. Kernels use `nvshmemx_collective_launch`;
+the queried maximum grid prevents waiting blocks from blocking unlaunched peers.
+See [NVIDIA's collective-launch requirements](https://docs.nvidia.com/nvshmem/api/latest/api/launch.html)
+and [memory-ordering rules](https://docs.nvidia.com/nvshmem/api/latest/gen/api/ordering.html).
+
+### Launch and verify InfiniBand
+
+Each process chooses CUDA device ordinal 0 relative to `CUDA_VISIBLE_DEVICES`.
+Use exactly one rank per node and expose its assigned GPU. Same-node placement
+is rejected with `MPI_Comm_split_type`. Initialization passes `MPI_COMM_WORLD`
+to `nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, ...)` and verifies PE IDs.
+
+The executable forces `NVSHMEM_REMOTE_TRANSPORT=ibrc`, disables IBGDA, P2P,
+MNNVL and NVSHMEM NCCL collectives, and directs NVSHMEM debug logs to
+`/dev/stderr`. This deliberately targets the IBRC proxy transport; IBGDA is
+not a selectable benchmark mode. GPU threads still issue every GET and signal;
+NVSHMEM's CPU proxy may progress the verbs operations. Allocate CPU resources
+for that proxy. MPI bootstrap/control traffic may use sockets.
+
+Verify on **both nodes** that the chosen HCA/port is active and its physical
+link layer is InfiniBand using `ibstat` or `ibv_devinfo`. IB verbs also supports
+RoCE, so selecting IBRC alone does not establish the physical fabric. Configure
+the site's matching HCAs and enable diagnostic logging, for example:
+
+```bash
+export NVSHMEM_SYMMETRIC_SIZE=33G
+export NVSHMEM_HCA_LIST=mlx5_0:1    # Replace with the site's adapter/port
+export NVSHMEM_DEBUG=INFO
+export NVSHMEM_DEBUG_SUBSYS=INIT,TRANSPORT,MEM
+mpirun -np 2 --host node-a,node-b --map-by ppr:1:node \
+    -x NVSHMEM_SYMMETRIC_SIZE -x NVSHMEM_HCA_LIST \
+    -x NVSHMEM_DEBUG -x NVSHMEM_DEBUG_SUBSYS \
+    ./bin/nvshmem_swap_bench \
+    --a-size 32G --element-bytes 8 --block-size 256 \
+    --sm-multiplier 1 --iterations 128 \
+    > results.csv 2> diagnostics.log
+```
+
+Adapt MPI flags for your launcher; with scheduler-provided placement, use
+`mpirun -np 2 ./bin/nvshmem_swap_bench ...`. Inspect both ranks' NVSHMEM logs
+for IBRC selection, the intended HCA/port, successful GPU-memory registration,
+and actual remote transport operation. The program reports the **requested**
+transport; it does not claim independent runtime path verification. Confirm
+GPUDirect RDMA using the site's supported `nvidia-peermem` or DMA-BUF setup,
+GPU/HCA topology, transport registration logs and, where available, NIC/GPU
+profiling counters. Confirm failure when the intended adapter is unavailable
+before collecting results. Do not label a run direct RDMA based solely on
+seeing an HCA in an initialization log. Reduce debug verbosity after verifying
+the path. Consult the [NVSHMEM environment reference](https://docs.nvidia.com/nvshmem/api/latest/gen/env.html)
+and [transport troubleshooting](https://docs.nvidia.com/nvshmem/api/latest/faq.html).
+
+Help, application configuration/errors and validation output go to stderr.
+NVSHMEM debug output is redirected where supported by the runtime. Configure
+MPI/scheduler diagnostics to stderr or separate files as well, and confirm
+CSV integrity with your installed stack; launcher/plugin output cannot be
+fully controlled by the application.
+
+### Timing, CSV and validation
+
+One untimed warm-up swaps A before measurement. Each timed iteration uses an
+MPI barrier, CUDA start event, exactly one complete swap kernel, CUDA stop
+event, stop-event synchronization and `cudaEventElapsedTime` on the same
+stream. MPI reduces the two times with MAX. Allocation, initialization,
+validation and cleanup are excluded; the timed interval includes every GET,
+signal/wait and B-to-A copy. Collective launch is called between the events,
+so host launch/setup gaps can contribute to the event interval.
+
+Rank 0 alone emits one header and the requested number of rows:
+
+```csv
+iteration,buffer_a_bytes,buffer_b_bytes,element_bytes,block_size,sm_multiplier,grid_blocks,chunk_bytes,elapsed_ms
+0,34359738368,229376,8,256,1,112,2048,1234.567
+```
+
+Values are illustrative. `--validate` takes original host snapshots before
+warm-up, exchanges references with MPI outside timing, then compares every
+byte on both GPUs after warm-up and every timed swap. Timed iteration 0
+restores each GPU's original data; iteration 1 contains its peer's original.
+Mismatch aborts the job. Validation MPI transfers are reference data only.
+
+Host tests need neither CUDA nor MPI:
+
+```bash
+g++ -std=c++17 -Wall -Wextra -Werror -Iinclude tests/nvshmem_swap_options_test.cpp -o /tmp/nvshmem_swap_options_test
+/tmp/nvshmem_swap_options_test
+```
+
+These cover defaults/options, all widths, various blocks/multipliers, tiny,
+exact and partial chunks/rounds, 64-bit overflow, hardware limits, signal
+counter exhaustion, heap capacity and free-memory rejection. On the allocated
+two-node GPU/IB cluster, build the program, verify transport, then run:
+
+```bash
+NVSHMEM_SYMMETRIC_SIZE=64M python3 tests/nvshmem_swap_runtime_test.py \
+    ./bin/nvshmem_swap_bench \
+    --launcher 'mpirun -np 2 --host node-a,node-b --map-by ppr:1:node -x NVSHMEM_SYMMETRIC_SIZE'
+# Add --sm-multipliers 1,2 if both devices support that cooperative grid.
+```
+
+The runner checks both ranks' validation of repeated swaps for all widths,
+several block sizes, sub-element tails, exact chunks, many rounds, CSV schema
+and row count, invalid options, oversized allocation and launch requests.
+Also verify one/three ranks, same-node placement, differing rank options/SM
+counts, unavailable HCAs, and a heap exceeding available GPU memory fail
+with diagnostics. These cluster checks, real CUDA device linking, event timing,
+32 GiB allocation and InfiniBand/GDR verification require the target hardware;
+host-only tests cannot establish them.

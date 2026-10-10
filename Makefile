@@ -9,6 +9,12 @@ BENCH_BIN ?= bin/gpu_comm_bench
 UVA_BIN ?= bin/uva_p2p_bench
 UVA_LDFLAGS ?=
 UVA_LDLIBS ?= -lcurand
+NVSHMEM_BIN ?= bin/nvshmem_swap_bench
+NVSHMEM_HOME ?= /usr/local/nvshmem
+NVSHMEM_CFLAGS ?= -I$(NVSHMEM_HOME)/include -rdc=true
+NVSHMEM_LDFLAGS ?= -L$(NVSHMEM_HOME)/lib
+NVSHMEM_LDLIBS ?= -lnvshmem_host -lnvshmem_device -lcurand
+NVSHMEM_MPI_LDFLAGS ?= -lmpi
 
 .PHONY: target
 target: $(BENCH_BIN)
@@ -21,6 +27,10 @@ $(UVA_BIN): src/uva_p2p_bench.cu include/uva_p2p_options.hpp include/bench_optio
 	mkdir -p $(dir $@)
 	$(NVCC) $(NVCC_CFLAGS) $< $(UVA_LDFLAGS) $(UVA_LDLIBS) --cudart=shared -o $@
 
+$(NVSHMEM_BIN): src/nvshmem_swap_bench.cu include/nvshmem_swap_options.hpp include/bench_options.hpp
+	mkdir -p $(dir $@)
+	$(NVCC) $(NVCC_CFLAGS) $(NVSHMEM_CFLAGS) $< $(NVSHMEM_LDFLAGS) $(NVSHMEM_MPI_LDFLAGS) $(NVSHMEM_LDLIBS) --cudart=shared -o $@
+
 .PHONY: clean
 clean:
-	$(RM) $(BENCH_BIN) $(UVA_BIN)
+	$(RM) $(BENCH_BIN) $(UVA_BIN) $(NVSHMEM_BIN)
