@@ -227,6 +227,146 @@ limits, size multiplication overflow and combined allocation overflow.
 GPU correctness, timing and transport verification require the actual
 CUDA/NCCL/MPI and two-node InfiniBand environment.
 
+## Single-process UVA/P2P buffer swap benchmark
+
+`bin/uva_p2p_bench` is a separate benchmark for **two GPUs in one host**, intended
+for NVLink. One host process manages CUDA devices 0 and 1 (relative to
+`CUDA_VISIBLE_DEVICES`). It uses neither MPI nor NCCL. The existing two-node
+MPI/NCCL benchmark and its default build target retain their behavior.
+
+### Prerequisites and build
+
+Use the same Makefile, `nvcc`, `nvccoptions`, `config.mk`, compiler flags and
+`atlc` CUDA/cuRAND checking headers described above. Only CUDA and cuRAND are
+needed for this executable; MPI and NCCL installations are unnecessary.
+For a CUDA-only installation, a minimal site-specific `config.mk` is:
+
+```make
+CFLAGS_VENDOR = -I/path/to/atlc/include
+GENCODE_FLAGS = -gencode=arch=compute_80,code=sm_80
+# Optional CUDA-only extra library search paths/link options:
+UVA_LDFLAGS =
+```
+
+```bash
+make bin/uva_p2p_bench
+```
+
+The new target reuses `NVCC_CFLAGS` but deliberately excludes `LDFLAGS_VENDOR`
+and `LDLIBS`, which can contain MPI/NCCL libraries. Its separate `UVA_LDFLAGS`
+and `UVA_LDLIBS` (default `-lcurand`) must contain only CUDA-related dependencies.
+`UVA_BIN` can override the output path; `make clean` removes both executables.
+
+Both GPUs must support UVA, and GPU 0 must support direct peer access to GPU 1.
+The program checks `cudaDeviceCanAccessPeer(0, 1)` and enables that direction
+using `cudaDeviceEnablePeerAccess`. Only GPU 0 executes the swap kernel, so
+reverse peer access is unnecessary. Unsupported UVA/P2P fails with an error.
+Each GPU needs **32 GiB free for A, plus CUDA/cuRAND overhead**, by default.
+Initialization allocates no additional application GPU staging or communication
+buffer; cuRAND and CUDA may require internal resources. Reduce A for smaller GPUs.
+
+**A successful CUDA P2P check does not prove NVLink connectivity.** Before
+collecting results, inspect:
+
+```bash
+nvidia-smi topo -m
+nvidia-smi topo -p2p n
+```
+
+In the topology matrix the selected pair should have an `NV#` connection;
+the `n` P2P query checks NVLink capability. Match the reported PCI bus IDs in
+stderr to the physical GPUs, especially when visibility reorders device ordinals.
+PCIe-only P2P can also pass the CUDA check. The executable explicitly reports
+NVLink as unverified; do not label such results NVLink measurements without
+verifying the pair's topology. These commands describe connectivity, not a
+measurement of actual link utilization during a run.
+
+### Execution and options
+
+Launch directly, without a multi-process launcher:
+
+```bash
+./bin/uva_p2p_bench \
+    --a-size 32G \
+    --element-bytes 8 \
+    --block-size 256 \
+    --iterations 128 \
+    > results.csv 2> diagnostics.log
+```
+
+| Option | Meaning | Default |
+|---|---|---|
+| `-a`, `--a-size SIZE` | A bytes **per GPU** | `32G` (32 GiB) |
+| `-e`, `--element-bytes N` | Unsigned typed access width: 1, 2, 4 or 8 bytes | `8` |
+| `-t`, `--block-size N` | CUDA threads per block | `256` |
+| `-n`, `--iterations N` | Timed complete swaps | `128` |
+| `--validate` | Compare both buffers after warm-up and every timed swap | Disabled |
+| `-h`, `--help` | Print help to stderr without accessing CUDA | |
+
+Sizes use the existing positive decimal and binary K/M/G suffix conventions.
+A must be divisible by the element width. Other widths, zero, signs, overflow,
+unknown options, missing arguments and positional arguments are rejected.
+Block size is checked against GPU 0's thread and block-x limits. The grid is
+`floor((A bytes / element bytes) / block size) + 1`, enforcing the strict
+inequality `block_size * grid_size * element_bytes > A bytes`, even for exact
+multiples. Grid limits and 64-bit coverage overflow are checked before launch.
+All index arithmetic is 64-bit; surplus threads are bounds checked.
+
+Each buffer is allocated with `cudaMalloc` and initialized with cuRAND using
+different seeds. For 1/2-byte sizes, a cuRAND device kernel fills any trailing
+bytes that cannot be generated as whole 32-bit words. GPU 0's kernel performs
+one local load, one direct UVA peer load, and two opposite stores per element.
+Each valid index belongs to exactly one thread. No second swap kernel runs on
+GPU 1, and the exchange uses no copy API or extra GPU buffer.
+
+### Timing, CSV and validation
+
+Both initializations complete before one untimed warm-up swap. Every timed
+iteration encloses one complete swap in CUDA start/stop events on GPU 0's
+launch stream. The stop event is synchronized before `cudaEventElapsedTime`
+and before the next iteration. Allocation, initialization, warm-up, validation
+and cleanup are excluded. These times cover a full in-place exchange including
+local memory operations and peer reads/writes; they are not isolated NVLink
+latency or bandwidth measurements.
+
+Stdout contains only this header and one row per timed iteration:
+
+```csv
+iteration,buffer_a_bytes,element_bytes,block_size,grid_size,elapsed_ms
+0,34359738368,8,256,16777217,123.456
+1,34359738368,8,256,16777217,122.987
+```
+
+Times are illustrative and in milliseconds. Diagnostics and validation results
+go to stderr. `--validate` requires A <= 16 MiB per GPU, takes original host
+snapshots before warm-up, and compares every byte of both buffers after each
+swap. Warm-up exchanges the originals; timed iteration 0 restores them,
+iteration 1 exchanges them again, and so on. Host copies serve only validation
+outside timing. Mismatches cause a nonzero exit status.
+
+Run both host-only test suites without CUDA, MPI or GPUs:
+
+```bash
+g++ -std=c++17 -Wall -Wextra -Werror -Iinclude tests/bench_options_test.cpp -o /tmp/bench_options_test
+/tmp/bench_options_test
+g++ -std=c++17 -Wall -Wextra -Werror -Iinclude tests/uva_p2p_options_test.cpp -o /tmp/uva_p2p_options_test
+/tmp/uva_p2p_options_test
+```
+
+The new suite checks defaults, all element widths, parsing errors, divisibility,
+validation bounds, strict grid coverage, hardware limits and arithmetic overflow.
+On the actual two-GPU system, after verifying NVLink topology, run:
+
+```bash
+python3 tests/uva_p2p_runtime_test.py ./bin/uva_p2p_bench
+```
+
+This integration test validates both GPUs across repeated swaps for every
+supported width, sub-word initialization, exact and partial blocks, and tiny
+buffers. It also checks help/errors and the CSV schema and row counts. GPU
+correctness, event timing, allocation at 32 GiB, and NVLink transport require
+the actual CUDA toolkit and two-GPU hardware; host tests cannot verify them.
+
 ## Acknowledgments
 
 This repository is based on results obtained from a project, JPNP20017,
