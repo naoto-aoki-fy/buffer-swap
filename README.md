@@ -1,6 +1,6 @@
 # GPU communication benchmark
 
-`bin/gpu_comm_bench` is a two-rank GPU communication benchmark for separate
+`bin/nccl_swap_bench` is a two-rank GPU communication benchmark for separate
 compute nodes connected by InfiniBand. Each rank owns a main GPU buffer A and a
 smaller receive buffer B. Consecutive chunks of A are sent to the peer using
 grouped `ncclSend`/`ncclRecv`; received chunks are copied from B into A on the
@@ -38,7 +38,7 @@ site modules or `LD_LIBRARY_PATH`.
 make
 ```
 
-The default target builds `bin/gpu_comm_bench` directly with `nvcc`, linking
+The default target builds `bin/nccl_swap_bench` directly with `nvcc`, linking
 cuRAND and NCCL plus the MPI flags in `LDFLAGS_VENDOR`. `NVCC`, `INCLUDE`,
 `LDLIBS` and `BENCH_BIN` remain overridable. No CMake or generated argument
 parser is required. `make clean` removes the benchmark executable.
@@ -76,7 +76,7 @@ on GPU buffers; MPI handles setup, barriers and time reductions.
 For a scheduler allocation already placing one process on each node:
 
 ```bash
-mpirun -np 2 ./bin/gpu_comm_bench \
+mpirun -np 2 ./bin/nccl_swap_bench \
     --a-size 32G \
     --b-size 1G \
     --iterations 128 \
@@ -88,14 +88,14 @@ An Open MPI example explicitly placing processes on two allocated nodes is:
 ```bash
 mpirun -np 2 --host node-a,node-b --map-by ppr:1:node \
     -x NCCL_IB_HCA -x NCCL_IB_DISABLE -x NCCL_DEBUG -x NCCL_DEBUG_SUBSYS \
-    ./bin/gpu_comm_bench -a 32G -b 1G -n 128 > results.csv 2> diagnostics.log
+    ./bin/nccl_swap_bench -a 32G -b 1G -n 128 > results.csv 2> diagnostics.log
 ```
 
 Set the exported variables as described below before using this command.
 For Slurm, request two nodes, one task and one GPU per node, for example
 `#SBATCH --nodes=2`, `#SBATCH --ntasks-per-node=1`, and
 `#SBATCH --gpus-per-node=1`, then use your site's supported MPI launch command
-(e.g. `srun --mpi=pmix -n 2 --ntasks-per-node=1 ./bin/gpu_comm_bench ...`).
+(e.g. `srun --mpi=pmix -n 2 --ntasks-per-node=1 ./bin/nccl_swap_bench ...`).
 PMIx/PMI selection, GPU binding, CPU binding, HCA selection and module names
 are site-specific; use the cluster's MPI and GPU allocation instructions.
 Do not launch outside an allocation on systems that require one.
@@ -198,14 +198,14 @@ same placement and NCCL settings as above:
 ```bash
 # Multiple chunks, an odd byte count, and a partial final chunk; test both parities.
 mpirun -np 2 --host node-a,node-b --map-by ppr:1:node \
-    ./bin/gpu_comm_bench -a 1003 -b 257 -n 3 --validate > validate-copy.csv
+    ./bin/nccl_swap_bench -a 1003 -b 257 -n 3 --validate > validate-copy.csv
 mpirun -np 2 --host node-a,node-b --map-by ppr:1:node \
-    ./bin/gpu_comm_bench -a 1003 -b 257 -n 3 --validate --skip-copy-back > validate-skip.csv
+    ./bin/nccl_swap_bench -a 1003 -b 257 -n 3 --validate --skip-copy-back > validate-skip.csv
 # Exact chunks, B larger than A, and sub-word cuRAND initialization.
 mpirun -np 2 --host node-a,node-b --map-by ppr:1:node \
-    ./bin/gpu_comm_bench -a 1024 -b 256 -n 2 --validate > validate-exact.csv
+    ./bin/nccl_swap_bench -a 1024 -b 256 -n 2 --validate > validate-exact.csv
 mpirun -np 2 --host node-a,node-b --map-by ppr:1:node \
-    ./bin/gpu_comm_bench -a 3 -b 7 -n 2 --validate > validate-tiny.csv
+    ./bin/nccl_swap_bench -a 3 -b 7 -n 2 --validate > validate-tiny.csv
 ```
 
 Check that each output has the exact CSV header, the requested number of
@@ -229,7 +229,7 @@ CUDA/NCCL/MPI and two-node InfiniBand environment.
 
 ## Single-process UVA/P2P buffer swap benchmark
 
-`bin/uva_p2p_bench` is a separate benchmark for **two GPUs in one host**, intended
+`bin/uva_swap_bench` is a separate benchmark for **two GPUs in one host**, intended
 for NVLink. One host process manages CUDA devices 0 and 1 (relative to
 `CUDA_VISIBLE_DEVICES`). It uses neither MPI nor NCCL. The existing two-node
 MPI/NCCL benchmark and its default build target retain their behavior.
@@ -249,7 +249,7 @@ UVA_LDFLAGS =
 ```
 
 ```bash
-make bin/uva_p2p_bench
+make bin/uva_swap_bench
 ```
 
 The new target reuses `NVCC_CFLAGS` but deliberately excludes `LDFLAGS_VENDOR`
@@ -286,7 +286,7 @@ measurement of actual link utilization during a run.
 Launch directly, without a multi-process launcher:
 
 ```bash
-./bin/uva_p2p_bench \
+./bin/uva_swap_bench \
     --a-size 32G \
     --element-bytes 8 \
     --block-size 256 \
@@ -358,7 +358,7 @@ validation bounds, strict grid coverage, hardware limits and arithmetic overflow
 On the actual two-GPU system, after verifying NVLink topology, run:
 
 ```bash
-python3 tests/uva_p2p_runtime_test.py ./bin/uva_p2p_bench
+python3 tests/uva_p2p_runtime_test.py ./bin/uva_swap_bench
 ```
 
 This integration test validates both GPUs across repeated swaps for every

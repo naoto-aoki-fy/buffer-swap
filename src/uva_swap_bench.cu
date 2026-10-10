@@ -12,7 +12,7 @@
 
 static void usage() {
     std::fprintf(stderr,
-        "Usage: uva_p2p_bench [options] (one process, CUDA devices 0 and 1)\n"
+        "Usage: uva_swap_bench [options] (one process, CUDA devices 0 and 1)\n"
         "  -a, --a-size SIZE       Buffer bytes per GPU (default 32G)\n"
         "  -e, --element-bytes N   Typed element size: 1, 2, 4, 8 (default 8)\n"
         "  -t, --block-size N      Threads per block (default 256)\n"
@@ -185,7 +185,7 @@ int main(int argc, char** argv) {
         }
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "uva_p2p_bench: %s\n", error.what());
+        std::fprintf(stderr, "uva_swap_bench: %s\n", error.what());
         return EXIT_FAILURE;
     }
 }

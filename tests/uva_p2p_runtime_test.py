@@ -7,7 +7,7 @@ import io
 import subprocess
 import sys
 
-binary = sys.argv[1] if len(sys.argv) > 1 else "./bin/uva_p2p_bench"
+binary = sys.argv[1] if len(sys.argv) > 1 else "./bin/uva_swap_bench"
 
 
 def run(args):

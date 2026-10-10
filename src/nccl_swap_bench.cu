@@ -20,7 +20,7 @@ static_assert(sizeof(size_t) >= 8, "This benchmark requires 64-bit size_t");
 
 static void usage() {
     std::fprintf(stderr,
-        "Usage: gpu_comm_bench [options] (exactly two ranks on separate nodes)\n"
+        "Usage: nccl_swap_bench [options] (exactly two ranks on separate nodes)\n"
         "  -a, --a-size SIZE       Main buffer bytes (default 32G)\n"
         "  -b, --b-size SIZE       Receive buffer bytes (default 1G)\n"
         "  -n, --iterations N      Timed exchanges (default 128)\n"
