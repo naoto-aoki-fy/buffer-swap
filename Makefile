@@ -21,7 +21,7 @@ $(UVA_BENCH_BIN): src/uva_swap_bench.cu include/uva_p2p_options.hpp include/benc
 
 $(NVSHMEM_BENCH_BIN): src/nvshmem_swap_bench.cu include/nvshmem_swap_options.hpp include/bench_options.hpp
 	mkdir -p $(dir $@)
-	$(NVCC) $(NVCC_CFLAGS) $< $(NVCC_LDFLAGS) --cudart=shared -o $@
+	$(NVCC) -rdc=true $(NVCC_CFLAGS) $< $(NVCC_LDFLAGS) --cudart=shared -lnvshmem_host -lnvshmem_device -o $@
 
 .PHONY: clean
 clean:
