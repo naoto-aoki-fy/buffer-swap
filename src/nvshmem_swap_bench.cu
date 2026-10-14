@@ -22,6 +22,7 @@ static void usage() {
     std::fprintf(stderr,
         "Usage: nvshmem_swap_bench [options] (exactly two ranks, one GPU per rank)\n"
         "  -a, --a-size SIZE       A bytes per GPU (default 32G)\n"
+        "  -c, --chunk-size SIZE   Download bytes per block (default 256K; multiple of -e)\n"
         "  -e, --element-bytes N   1, 2, 4 or 8 (default 8)\n"
         "  -t, --block-size N      Threads per block (default 256)\n"
         "  -m, --sm-multiplier N   Blocks per SM (default 1)\n"
@@ -39,9 +40,10 @@ __global__ void random_tail(unsigned char* tail, size_t bytes, unsigned long lon
     for (size_t i = 0; i < bytes; ++i) tail[i] = static_cast<unsigned char>(value >> (8 * i));
 }
 
+template <typename T>
 __global__ void swap_buffer(unsigned char* a, unsigned char* b, uint64_t* signals,
                             uint64_t a_bytes, uint64_t chunk_bytes,
-                            uint64_t element_bytes, uint64_t generation, int peer) {
+                            uint64_t generation, int peer) {
     const uint64_t stride = uint64_t(gridDim.x) * chunk_bytes;
     unsigned char* staging = b + uint64_t(blockIdx.x) * chunk_bytes;
     uint64_t round = 0;
@@ -63,9 +65,17 @@ __global__ void swap_buffer(unsigned char* a, unsigned char* b, uint64_t* signal
                                       generation + round + 1);
         }
         __syncthreads();
-        const uint64_t first = uint64_t(threadIdx.x) * element_bytes;
-        for (uint64_t j = 0; j < element_bytes && first + j < bytes; ++j)
-            a[offset + first + j] = staging[first + j];
+        // Chunk boundaries are aligned to T. Adjacent threads copy adjacent
+        // elements on each pass, advancing by one block of elements per pass.
+        auto* destination = reinterpret_cast<T*>(a + offset);
+        const auto* source = reinterpret_cast<const T*>(staging);
+        const uint64_t elements = bytes / sizeof(T);
+        for (uint64_t i = threadIdx.x; i < elements; i += blockDim.x)
+            destination[i] = source[i];
+        // The last chunk of A may end with fewer than sizeof(T) bytes.
+        const uint64_t tail = elements * sizeof(T);
+        for (uint64_t i = threadIdx.x; i < bytes - tail; i += blockDim.x)
+            a[offset + tail + i] = staging[tail + i];
         __syncthreads(); // Complete the copy before reusing this block's B.
         if (stride >= remaining) break; // Avoid overflowing a 64-bit offset.
         offset += stride;
@@ -94,9 +104,9 @@ int main(int argc, char** argv) {
         ATLC_CHECK_MPI(MPI_Comm_set_errhandler, MPI_COMM_WORLD, MPI_ERRORS_RETURN);
         ATLC_CHECK_MPI(MPI_Comm_rank, MPI_COMM_WORLD, &rank);
         const auto o = nvshmem_swap::parse_options(argc, argv);
-        const uint64_t config[] = {o.a_size, o.element_bytes, o.block_size, o.sm_multiplier,
+        const uint64_t config[] = {o.a_size, o.chunk_size, o.element_bytes, o.block_size, o.sm_multiplier,
                                    o.iterations, uint64_t(o.validate), uint64_t(o.help)};
-        matching(config, 7);
+        matching(config, 8);
         if (o.help) {
             if (!rank) usage();
             ATLC_CHECK_MPI(MPI_Finalize);
@@ -207,10 +217,16 @@ int main(int argc, char** argv) {
         }
         ATLC_CHECK_CUDA(cudaStreamSynchronize, stream);
         ATLC_CHECK_CURAND(curandDestroyGenerator, rng);
-        uint64_t a_bytes = o.a_size, chunk = l.chunk_bytes, element = o.element_bytes, generation = 0;
+        uint64_t a_bytes = o.a_size, chunk = l.chunk_bytes, generation = 0;
         int peer = 1 - rank;
-        void* args[] = {&a, &b, &signals, &a_bytes, &chunk, &element, &generation, &peer};
-        const void* kernel = reinterpret_cast<const void*>(swap_buffer);
+        void* args[] = {&a, &b, &signals, &a_bytes, &chunk, &generation, &peer};
+        const void* kernel = nullptr;
+        switch (o.element_bytes) {
+            case 1: kernel = reinterpret_cast<const void*>(swap_buffer<uint8_t>); break;
+            case 2: kernel = reinterpret_cast<const void*>(swap_buffer<uint16_t>); break;
+            case 4: kernel = reinterpret_cast<const void*>(swap_buffer<uint32_t>); break;
+            case 8: kernel = reinterpret_cast<const void*>(swap_buffer<uint64_t>); break;
+        }
         int max_blocks = 0;
         check_nvshmem(nvshmemx_collective_launch_query_gridsize(kernel, dim3(o.block_size), args,
                                                                0, &max_blocks), "collective launch query");

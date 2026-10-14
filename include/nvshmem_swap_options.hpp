@@ -6,6 +6,7 @@ namespace nvshmem_swap {
 static_assert(sizeof(size_t) >= 8, "This benchmark requires 64-bit size_t");
 struct Options {
     size_t a_size = size_t{32} << 30;
+    size_t chunk_size = size_t{256} << 10;
     uint64_t element_bytes = 8, block_size = 256, sm_multiplier = 1, iterations = 128;
     bool validate = false, help = false;
 };
@@ -13,6 +14,7 @@ inline Options parse_options(int argc, char** argv) {
     Options o;
     const option long_options[] = {
         {"a-size", required_argument, nullptr, 'a'},
+        {"chunk-size", required_argument, nullptr, 'c'},
         {"element-bytes", required_argument, nullptr, 'e'},
         {"block-size", required_argument, nullptr, 't'},
         {"sm-multiplier", required_argument, nullptr, 'm'},
@@ -22,9 +24,10 @@ inline Options parse_options(int argc, char** argv) {
     };
     opterr = 0;
     int c;
-    while ((c = getopt_long(argc, argv, "a:e:t:m:n:h", long_options, nullptr)) != -1) {
+    while ((c = getopt_long(argc, argv, "a:c:e:t:m:n:h", long_options, nullptr)) != -1) {
         switch (c) {
             case 'a': o.a_size = bench::parse_size(optarg); break;
+            case 'c': o.chunk_size = bench::parse_size(optarg); break;
             case 'e': o.element_bytes = bench::positive_integer(optarg); break;
             case 't': o.block_size = bench::positive_integer(optarg); break;
             case 'm': o.sm_multiplier = bench::positive_integer(optarg); break;
@@ -37,6 +40,8 @@ inline Options parse_options(int argc, char** argv) {
     if (optind != argc) throw std::invalid_argument("unexpected positional argument");
     if (o.element_bytes != 1 && o.element_bytes != 2 && o.element_bytes != 4 && o.element_bytes != 8)
         throw std::invalid_argument("element bytes must be 1, 2, 4 or 8");
+    if (!o.chunk_size || o.chunk_size % o.element_bytes)
+        throw std::invalid_argument("chunk size must be positive and a multiple of element bytes");
     if (o.validate && o.a_size > (size_t{16} << 20))
         throw std::invalid_argument("--validate requires A <= 16 MiB per GPU");
     return o;
@@ -57,11 +62,14 @@ inline Layout layout(const Options& o, uint64_t sms, uint64_t max_threads,
                      uint64_t max_block_x, uint64_t max_grid_x) {
     if (!o.a_size || !o.block_size || o.block_size > max_threads || o.block_size > max_block_x)
         throw std::invalid_argument("block size exceeds hardware limits or zero A size");
+    if ((o.element_bytes != 1 && o.element_bytes != 2 && o.element_bytes != 4 && o.element_bytes != 8) ||
+        !o.chunk_size || o.chunk_size % o.element_bytes)
+        throw std::invalid_argument("invalid element bytes or unaligned chunk size");
     Layout l{};
     l.grid_blocks = multiply(sms, o.sm_multiplier);
     if (l.grid_blocks > max_grid_x || l.grid_blocks > INT32_MAX)
         throw std::invalid_argument("grid blocks exceed hardware limits");
-    l.chunk_bytes = multiply(o.element_bytes, o.block_size);
+    l.chunk_bytes = o.chunk_size;
     l.b_bytes = multiply(l.chunk_bytes, l.grid_blocks);
     l.signal_bytes = multiply(l.grid_blocks, sizeof(uint64_t));
     l.rounds = o.a_size / l.b_bytes + (o.a_size % l.b_bytes != 0);

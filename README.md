@@ -440,11 +440,9 @@ Match its supported CUDA/driver versions. GPUs must be Volta or newer, support C
 cooperative launch, and be exclusively allocated to these processes.
 
 The NVSHMEM rule currently uses the shared `NVCC_CFLAGS` and `NVCC_LDFLAGS`.
-It has no dedicated NVSHMEM flag variables, and its compile command omits
-the source file despite listing it as a prerequisite. Therefore,
-`make bin/nvshmem_swap_bench` alone does not compile the benchmark from its
-source. To build with the current Makefile, configure the shared flags and
-override `NVCC` to supply the missing source and `-rdc=true` as shown below.
+It supplies the source file, `-rdc=true`, and the NVSHMEM host/device libraries.
+Configure the shared include and link flags for your installation, then build
+with `make bin/nvshmem_swap_bench`.
 
 For example, use these site-specific settings in `config.mk` for this build:
 
@@ -467,8 +465,7 @@ for CUDA, MPI, NVSHMEM and its bootstrap/transport plugins using modules or
 `LD_LIBRARY_PATH` on both nodes. MPI must match the NVSHMEM MPI bootstrap build.
 
 ```bash
-make bin/nvshmem_swap_bench \
-    NVCC='nvcc --forward-unknown-to-host-compiler -rdc=true src/nvshmem_swap_bench.cu'
+make bin/nvshmem_swap_bench
 ```
 
 `NVSHMEM_BENCH_BIN` overrides the executable path; `make clean` removes it too.
@@ -479,7 +476,8 @@ See NVIDIA's [NVSHMEM compilation and MPI interoperability guide](https://docs.n
 | Option | Meaning | Default |
 |---|---|---|
 | `-a`, `--a-size SIZE` | A bytes per GPU | `32G` (32 GiB) |
-| `-e`, `--element-bytes N` | Bytes assigned to each copying thread; 1, 2, 4 or 8 | `8` |
+| `-c`, `--chunk-size SIZE` | Download bytes per block, independent of thread count | `256K` (256 KiB) |
+| `-e`, `--element-bytes N` | Typed copy width per thread per pass; 1, 2, 4 or 8 | `8` |
 | `-t`, `--block-size N` | CUDA threads per block | `256` |
 | `-m`, `--sm-multiplier N` | Multiplier of the GPU SM count | `1` |
 | `-n`, `--iterations N` | Timed complete swaps | `128` |
@@ -488,9 +486,11 @@ See NVIDIA's [NVSHMEM compilation and MPI interoperability guide](https://docs.n
 
 Positive decimal sizes use the existing binary K/M/G suffix convention.
 Arbitrary byte sizes are accepted, including a tail smaller than one element.
-The element size controls chunk size and per-thread byte-copy work; it does
-not impose divisibility on A. Signs, zero, fractions, overflow, unsupported
-widths and positional arguments fail. Validation limits A to 16 MiB.
+The chunk size is independent of element size and block size, and must be a
+positive multiple of the element size so all typed copies are aligned.
+Neither A nor the final downloaded chunk must be divisible by the element
+size. Signs, zero, fractions, overflow, unsupported widths, unaligned chunk
+sizes and positional arguments fail. Validation limits A to 16 MiB.
 
 The launch grid is exactly `SM_count * sm_multiplier`. Both ranks must agree
 on all options and have equal SM counts, ensuring matching block ownership
@@ -499,7 +499,7 @@ NVSHMEM collective-launch capacity. An unsupported multiplier fails instead
 of oversubscribing waiting blocks; reduce it or the block size.
 
 A and B are symmetric GPU allocations, with B exactly
-`element_bytes * block_size * grid_blocks` bytes. One symmetric 64-bit signal
+`chunk_size * grid_blocks` bytes. One symmetric 64-bit signal
 is allocated per block. B is symmetric so that the IBRC GET destination is
 registered GPU memory; no separate registration or host staging is needed.
 A uses different cuRAND seeds on the two ranks, with a cuRAND device kernel
@@ -532,8 +532,23 @@ fetches only the remaining bytes of a partial final chunk, with every thread
 participating. After a block barrier, thread 0 completes outstanding operations,
 signals the peer's corresponding block with a generation counter, drains the
 signal, and waits for the peer's counter to reach that generation. Only then
-do all threads copy their assigned bytes from B into A. A block barrier
-completes the copy before reusing B.
+do all threads copy B back into A. For element type `T`, thread `t` copies
+`T` elements at indices `t`, `t + block_size`, `t + 2 * block_size`, and so on.
+Each pass reads and writes consecutive elements across adjacent threads for
+coalesced access. A sub-element byte tail is copied separately, also with
+adjacent threads handling consecutive bytes. A block barrier completes all
+passes and the tail before reusing B. The GET and peer handshake happen once
+per chunk, rather than once per copy pass.
+
+For example, `-c 256K -e 8 -t 256` downloads 256 KiB per block and copies
+128 passes of 256 eight-byte elements for a full chunk. With 112 blocks, B
+uses 28 MiB. Set `-c 2K` with `-e 8 -t 256` to reproduce the previous chunk
+and B sizes, or vary `-c` without changing the thread count:
+
+```bash
+NVSHMEM_SYMMETRIC_SIZE=33G mpirun -np 2 ./bin/nvshmem_swap_bench \
+    -a 32G -c 256K -e 8 -t 256 -m 1 -n 128
+```
 
 Counters use a distinct range for each swap, including warm-up, and are never
 reset between iterations. Signal completion prevents an older SET arriving
@@ -657,7 +672,7 @@ Rank 0 alone emits one header and the requested number of rows:
 
 ```csv
 iteration,buffer_a_bytes,buffer_b_bytes,element_bytes,block_size,sm_multiplier,grid_blocks,chunk_bytes,elapsed_ms
-0,34359738368,229376,8,256,1,112,2048,1234.567
+0,34359738368,29360128,8,256,1,112,262144,1234.567
 ```
 
 Values are illustrative. `--validate` takes original host snapshots before
@@ -673,8 +688,9 @@ g++ -std=c++17 -Wall -Wextra -Werror -Iinclude tests/nvshmem_swap_options_test.c
 /tmp/nvshmem_swap_options_test
 ```
 
-These cover defaults/options, all widths, various blocks/multipliers, tiny,
-exact and partial chunks/rounds, 64-bit overflow, hardware limits, signal
+These cover defaults/options, independent chunk sizing, all widths, various
+blocks/multipliers, tiny, exact and partial chunks/rounds, 64-bit overflow,
+hardware limits, signal
 counter exhaustion, heap capacity and free-memory rejection. On the allocated
 two-node GPU/IB cluster, build the program, verify transport, then run:
 
@@ -696,8 +712,10 @@ CUDA_VISIBLE_DEVICES=0,1 NVSHMEM_SYMMETRIC_SIZE=64M \
 ```
 
 The runner checks both ranks' validation of repeated swaps for all widths,
-several block sizes, sub-element tails, exact chunks, many rounds, CSV schema
-and row count, invalid options, oversized allocation and launch requests.
+several block sizes, independent chunk sizes, multiple copy passes, partial
+passes, sub-element tails (including one-thread blocks), exact chunks, many
+rounds, CSV schema and row count, invalid options, oversized allocation and
+launch requests.
 Also verify one/three ranks, duplicate GPU assignments, unavailable local P2P,
 differing rank options/SM counts, unavailable HCAs in two-node mode, and a heap
 exceeding available GPU memory fail with diagnostics. These cluster checks, real CUDA device linking, event timing,
