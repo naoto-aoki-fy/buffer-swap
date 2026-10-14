@@ -20,7 +20,7 @@ static_assert(sizeof(size_t) >= 8, "This benchmark requires 64-bit size_t");
 
 static void usage() {
     std::fprintf(stderr,
-        "Usage: nccl_swap_bench [options] (exactly two ranks on separate nodes)\n"
+        "Usage: nccl_swap_bench [options] (exactly two ranks, one GPU per rank)\n"
         "  -a, --a-size SIZE       Main buffer bytes (default 32G)\n"
         "  -b, --b-size SIZE       Receive buffer bytes (default 1G)\n"
         "  -n, --iterations N      Timed exchanges (default 128)\n"
@@ -102,32 +102,44 @@ int main(int argc, char** argv) {
         ATLC_CHECK_MPI(MPI_Comm_size, MPI_COMM_WORLD, &ranks);
         if (ranks != 2) throw std::runtime_error("exactly two MPI ranks are required");
 
-        // Reject local placement: it could silently benchmark NVLink/PCIe.
+        // Assign GPUs using the rank within each shared-memory node.
         MPI_Comm local;
         ATLC_CHECK_MPI(MPI_Comm_split_type, MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED,
                        rank, MPI_INFO_NULL, &local);
-        int local_size;
+        int local_size, local_rank;
         ATLC_CHECK_MPI(MPI_Comm_size, local, &local_size);
-        ATLC_CHECK_MPI(MPI_Comm_free, &local);
-        if (local_size != 1)
-            throw std::runtime_error("place one MPI rank on each of two separate nodes");
+        ATLC_CHECK_MPI(MPI_Comm_rank, local, &local_rank);
         int devices;
         ATLC_CHECK_CUDA(cudaGetDeviceCount, &devices);
         if (!devices) throw std::runtime_error("no visible CUDA device");
-        // Ordinal is relative to CUDA_VISIBLE_DEVICES; one rank per node.
-        ATLC_CHECK_CUDA(cudaSetDevice, 0);
+        // Per-process GPU binding may expose only the assigned device.
+        // Otherwise local ranks must see the same ordered device list.
+        const int device = devices == 1 ? 0 : local_rank;
+        if (device >= devices)
+            throw std::runtime_error("not enough visible CUDA devices for local MPI ranks");
+        ATLC_CHECK_CUDA(cudaSetDevice, device);
         cudaDeviceProp properties;
-        ATLC_CHECK_CUDA(cudaGetDeviceProperties, &properties, 0);
+        ATLC_CHECK_CUDA(cudaGetDeviceProperties, &properties, device);
+        // UUIDs detect accidental sharing even with different visibility lists.
+        std::vector<cudaUUID_t> local_uuids(local_size);
+        ATLC_CHECK_MPI(MPI_Allgather, &properties.uuid, int(sizeof(cudaUUID_t)), MPI_BYTE,
+                       local_uuids.data(), int(sizeof(cudaUUID_t)), MPI_BYTE, local);
+        ATLC_CHECK_MPI(MPI_Comm_free, &local);
+        if (local_size == 2 &&
+            std::equal(local_uuids[0].bytes, local_uuids[0].bytes + sizeof(local_uuids[0].bytes),
+                       local_uuids[1].bytes))
+            throw std::runtime_error("local ranks must use distinct GPUs; check CUDA_VISIBLE_DEVICES");
         char hostname[MPI_MAX_PROCESSOR_NAME] = {};
         int hostname_length;
         ATLC_CHECK_MPI(MPI_Get_processor_name, hostname, &hostname_length);
-        std::fprintf(stderr, "rank %d host %.*s CUDA device 0: %s; A=%zu B=%zu copy_back=%d\n",
-                     rank, hostname_length, hostname, properties.name,
-                     options.a_size, options.b_size, int(options.copy_back));
+        std::fprintf(stderr, "rank %d host %.*s CUDA device %d: %s; A=%zu B=%zu copy_back=%d; placement=%s\n",
+                     rank, hostname_length, hostname, device, properties.name,
+                     options.a_size, options.b_size, int(options.copy_back),
+                     local_size == 2 ? "single-node" : "two-node");
 
-        // Force the built-in IB verbs network and stderr logging before any
-        // NCCL call. Merely setting NCCL_IB_DISABLE=0 permits socket fallback.
-        if (setenv("NCCL_NET", "IB", 1) ||
+        // Cross-node runs force IB; local runs let NCCL select P2P/SHM
+        // without requiring an IB adapter. Keep NCCL logs off CSV stdout.
+        if ((local_size == 1 ? setenv("NCCL_NET", "IB", 1) : unsetenv("NCCL_NET")) ||
             setenv("NCCL_DEBUG_FILE", "/dev/stderr", 1))
             throw std::runtime_error("failed to configure NCCL environment");
         int nccl_version;

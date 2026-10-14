@@ -1,8 +1,8 @@
 # GPU communication benchmark
 
-`bin/nccl_swap_bench` is a two-rank GPU communication benchmark for separate
-compute nodes connected by InfiniBand. Each rank owns a main GPU buffer A and a
-smaller receive buffer B. Consecutive chunks of A are sent to the peer using
+`bin/nccl_swap_bench` is a two-rank GPU communication benchmark for two GPUs
+in one node or separate compute nodes connected by InfiniBand. Each rank owns
+a main GPU buffer A and a smaller receive buffer B. Consecutive chunks of A are sent to the peer using
 grouped `ncclSend`/`ncclRecv`; received chunks are copied from B into A on the
 same CUDA stream. The final chunk can be smaller than B. Only these two data
 buffers are allocated, using `cudaMalloc` and initialized with cuRAND.
@@ -66,9 +66,9 @@ Allocation errors and insufficient memory abort the MPI job.
 
 ## Launch on two nodes
 
-Run exactly two MPI ranks, with **one rank per node**. The program rejects
-same-node placement to avoid measuring NVLink or PCIe. Each rank selects CUDA
-device ordinal 0 relative to its `CUDA_VISIBLE_DEVICES` setting; let your
+Run exactly two MPI ranks, with **one rank per node**. Same-node placement
+selects the local GPU mode described below. For two-node runs, each rank
+selects CUDA device ordinal 0 relative to its `CUDA_VISIBLE_DEVICES` setting; let your
 scheduler expose the assigned GPU, or set the appropriate visibility per node.
 MPI broadcasts the NCCL unique ID. All benchmark payload transfers use NCCL
 on GPU buffers; MPI handles setup, barriers and time reductions.
@@ -100,10 +100,40 @@ PMIx/PMI selection, GPU binding, CPU binding, HCA selection and module names
 are site-specific; use the cluster's MPI and GPU allocation instructions.
 Do not launch outside an allocation on systems that require one.
 
+## Launch on one node with two GPUs
+
+Run exactly two MPI ranks on the same node, one per GPU. When both ranks see
+the same ordered `CUDA_VISIBLE_DEVICES` list, local rank 0 selects device 0
+and local rank 1 selects device 1. If the scheduler exposes only one GPU per
+process, each rank selects its visible device 0. The selected GPU UUIDs must
+be distinct; assigning both ranks to the same GPU fails before NCCL setup.
+The benchmark still exchanges buffers between exactly two GPUs; three or
+more MPI ranks are not supported.
+
+For example, with Open MPI on a host with two available GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 mpirun -np 2 --map-by ppr:2:node \
+    ./bin/nccl_swap_bench -a 1003 -b 257 -n 3 --validate \
+    > results.csv 2> diagnostics.log
+# Also validate without copying received chunks back into A:
+CUDA_VISIBLE_DEVICES=0,1 mpirun -np 2 --map-by ppr:2:node \
+    ./bin/nccl_swap_bench -a 1003 -b 257 -n 3 --validate --skip-copy-back \
+    > results-skip.csv 2> diagnostics-skip.log
+```
+
+Local runs clear `NCCL_NET` and let NCCL select its available transports,
+including P2P over NVLink/PCIe or SHM. No InfiniBand adapter is required.
+Other NCCL environment settings still apply. Inspect NCCL channel logs and
+GPU topology to identify the actual transport; local placement alone does
+not establish NVLink use. Buffer sizes, timing, validation and CSV format
+are the same as in two-node runs. Each GPU needs room for A+B plus runtime
+overhead; reduce the default sizes for smaller GPUs.
+
 ## Require and verify InfiniBand
 
-The program sets `NCCL_NET=IB` before the first NCCL call, overriding any
-inherited setting. This forces NCCL's built-in IB verbs network rather than
+For two-node runs, the program sets `NCCL_NET=IB` before the first NCCL call,
+overriding any inherited setting. This forces NCCL's built-in IB verbs network rather than
 allowing TCP socket fallback. It also sets `NCCL_DEBUG_FILE=/dev/stderr`,
 overriding inherited log destinations, so NCCL diagnostics cannot pollute CSV
 stdout. External network plugins with other names are not supported by this
@@ -209,9 +239,9 @@ mpirun -np 2 --host node-a,node-b --map-by ppr:1:node \
 ```
 
 Check that each output has the exact CSV header, the requested number of
-rows and five fields per row. Also check that one/three ranks, two ranks on
-a single node, conflicting rank options and excessive allocation requests
-fail with diagnostics on stderr. Test invalid options and `--help` without a
+rows and five fields per row. Also check that one/three ranks, two ranks
+assigned to the same GPU on a single node, conflicting rank options and
+excessive allocation requests fail with diagnostics on stderr. Test invalid options and `--help` without a
 GPU; help should leave stdout empty.
 
 Host-only option tests can run without CUDA or MPI:
@@ -225,14 +255,14 @@ They cover defaults, binary suffixes, arbitrary byte sizes, copy mode,
 validation bounds, invalid options, missing arguments, unsigned integer
 limits, size multiplication overflow and combined allocation overflow.
 GPU correctness, timing and transport verification require the actual
-CUDA/NCCL/MPI and two-node InfiniBand environment.
+CUDA/NCCL/MPI and either a two-GPU node or two-node InfiniBand environment.
 
 ## Single-process UVA/P2P buffer swap benchmark
 
 `bin/uva_swap_bench` is a separate benchmark for **two GPUs in one host**, intended
 for NVLink. One host process manages CUDA devices 0 and 1 (relative to
-`CUDA_VISIBLE_DEVICES`). It uses neither MPI nor NCCL. The existing two-node
-MPI/NCCL benchmark and its default build target retain their behavior.
+`CUDA_VISIBLE_DEVICES`). It uses neither MPI nor NCCL. The MPI/NCCL benchmark
+also supports two GPUs in one host using two MPI ranks.
 
 ### Prerequisites and build
 
