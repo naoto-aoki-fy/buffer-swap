@@ -39,9 +39,19 @@ make
 ```
 
 The default target builds `bin/nccl_swap_bench` directly with `nvcc`, linking
-cuRAND and NCCL plus the MPI flags in `LDFLAGS_VENDOR`. `NVCC`, `INCLUDE`,
-`LDLIBS` and `BENCH_BIN` remain overridable. No CMake or generated argument
-parser is required. `make clean` removes the benchmark executable.
+cuRAND and NCCL plus the MPI flags in `LDFLAGS_VENDOR`. All three executable
+rules share `NVCC_CFLAGS` and `NVCC_LDFLAGS`: `CFLAGS_VENDOR`, `INCLUDE` and
+`GENCODE_FLAGS` supply compile options, while `LDFLAGS_VENDOR` and `LDLIBS`
+supply link options. `LDLIBS` defaults to `-lcurand -lnccl`, and CUDA runtime
+linking is shared (`--cudart=shared`). `NVCC` and `INCLUDE` default to
+`nvcc --forward-unknown-to-host-compiler` and `-I./include`, respectively.
+
+`NCCL_BENCH_BIN`, `UVA_BENCH_BIN` and `NVSHMEM_BENCH_BIN` override the output
+paths. `make` (or `make target`) builds only the NCCL executable; request the
+other executable paths explicitly. When overriding an output path, request
+that path as the target, for example `make UVA_BENCH_BIN=bin/uva_custom bin/uva_custom`.
+No CMake or generated argument parser is required. `make clean` removes all
+three configured executable paths.
 
 ## Options
 
@@ -275,17 +285,22 @@ For a CUDA-only installation, a minimal site-specific `config.mk` is:
 CFLAGS_VENDOR = -I/path/to/atlc/include
 GENCODE_FLAGS = -gencode=arch=compute_80,code=sm_80
 # Optional CUDA-only extra library search paths/link options:
-UVA_LDFLAGS =
+LDFLAGS_VENDOR =
+LDLIBS = -lcurand
 ```
 
 ```bash
 make bin/uva_swap_bench
 ```
 
-The new target reuses `NVCC_CFLAGS` but deliberately excludes `LDFLAGS_VENDOR`
-and `LDLIBS`, which can contain MPI/NCCL libraries. Its separate `UVA_LDFLAGS`
-and `UVA_LDLIBS` (default `-lcurand`) must contain only CUDA-related dependencies.
-`UVA_BIN` can override the output path; `make clean` removes both executables.
+The target uses the same `NVCC_CFLAGS` and `NVCC_LDFLAGS` as the NCCL target,
+including `LDFLAGS_VENDOR` and `LDLIBS`. The Makefile's default `LDLIBS` links
+NCCL even though the UVA source does not use it. For a CUDA-only build, use
+these settings or pass `LDLIBS=-lcurand` on the command line, and remove
+MPI/NCCL dependencies from `LDFLAGS_VENDOR`. These shared settings also affect
+the other targets; restore their required libraries when building them.
+`UVA_BENCH_BIN` overrides the output path; `make clean` removes all three
+configured executables.
 
 Both GPUs must support UVA, and GPU 0 must support direct peer access to GPU 1.
 The program checks `cudaDeviceCanAccessPeer(0, 1)` and enables that direction
@@ -423,33 +438,36 @@ libraries (e.g. 2.8 or later), built with MPI bootstrap and, for two-node runs,
 IBRC support. Match its supported CUDA/driver versions. GPUs must be Volta or newer, support CUDA
 cooperative launch, and be exclusively allocated to these processes.
 
-For example, add these site-specific settings to `config.mk`:
+The NVSHMEM rule currently uses the shared `NVCC_CFLAGS` and `NVCC_LDFLAGS`.
+It has no dedicated NVSHMEM flag variables, and its compile command omits
+the source file despite listing it as a prerequisite. Therefore,
+`make bin/nvshmem_swap_bench` alone does not compile the benchmark from its
+source. To build with the current Makefile, configure the shared flags and
+override `NVCC` to supply the missing source and `-rdc=true` as shown below.
+
+For example, use these site-specific settings in `config.mk` for this build:
 
 ```make
-CFLAGS_VENDOR = -I/path/to/atlc/include -I/path/to/mpi/include
+CFLAGS_VENDOR = -I/path/to/atlc/include -I/path/to/mpi/include -I/path/to/nvshmem/include
 GENCODE_FLAGS = -gencode=arch=compute_80,code=sm_80
-NVSHMEM_HOME = /path/to/nvshmem
-NVSHMEM_MPI_LDFLAGS = -L/path/to/mpi/lib -lmpi
-# Defaults below can be overridden for lib64 or additional vendor libraries:
-NVSHMEM_CFLAGS = -I$(NVSHMEM_HOME)/include -rdc=true
-NVSHMEM_LDFLAGS = -L$(NVSHMEM_HOME)/lib
-NVSHMEM_LDLIBS = -lnvshmem_host -lnvshmem_device -lcurand
+# Adjust lib to lib64 if required by your installation:
+LDFLAGS_VENDOR = -L/path/to/mpi/lib -lmpi -L/path/to/nvshmem/lib
+LDLIBS = -lnvshmem_host -lnvshmem_device -lcurand
 ```
 
 Supply the complete compile/link flags from your MPI wrapper, and any
 installation-specific NVSHMEM dependencies (such as `-lmlx5` if required by
 that build). Obtain compiler flags using `nvccoptions` as usual. The single
 `nvcc` invocation with `-rdc=true` compiles and device-links the kernel against
-`libnvshmem_device.a`; retain this flag when overriding `NVSHMEM_CFLAGS`.
-The target reuses `NVCC_CFLAGS` and uses the NVSHMEM-specific library settings
-above instead of `LDLIBS`. `NVSHMEM_MPI_LDFLAGS` defaults to `LDFLAGS_VENDOR`;
-set it explicitly to MPI-only flags if the vendor flags include NCCL libraries.
-NVSHMEM-specific flags apply only to this target. Set runtime library paths
+`libnvshmem_device.a`; retain this flag when customizing the command below.
+The shared flags above also affect the NCCL and UVA targets; restore the
+appropriate settings when building those executables. Set runtime library paths
 for CUDA, MPI, NVSHMEM and its bootstrap/transport plugins using modules or
 `LD_LIBRARY_PATH` on both nodes. MPI must match the NVSHMEM MPI bootstrap build.
 
 ```bash
-make bin/nvshmem_swap_bench
+make bin/nvshmem_swap_bench \
+    NVCC='nvcc --forward-unknown-to-host-compiler -rdc=true src/nvshmem_swap_bench.cu'
 ```
 
 `NVSHMEM_BENCH_BIN` overrides the executable path; `make clean` removes it too.
