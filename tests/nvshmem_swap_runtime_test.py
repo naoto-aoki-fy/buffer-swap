@@ -59,6 +59,11 @@ def main():
                         assert math.isfinite(elapsed) and elapsed >= 0
                     assert 'rank 0: warm-up and all timed swaps validated' in result.stderr
                     assert 'rank 1: warm-up and all timed swaps validated' in result.stderr
+                    if 'NVSHMEM_IB_ENABLE_IBGDA' in env:
+                        for rank in [0, 1]:
+                            assert (f'rank {rank} NVSHMEM_IB_ENABLE_IBGDA='
+                                    f'{env["NVSHMEM_IB_ENABLE_IBGDA"]} (verify path in runtime logs)'
+                                    in result.stderr), result.stderr
                     cases += 1
     print(f'{cases} NVSHMEM validation/CSV cases passed')
 

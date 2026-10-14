@@ -148,9 +148,9 @@ int main(int argc, char** argv) {
         // meaningful and avoids VMM/registration differences between releases.
         environment("NVSHMEM_SYMMETRIC_SIZE", std::to_string(heap_bytes).c_str());
         environment("NVSHMEM_DISABLE_CUDA_VMM", "1");
-        // Local runs use P2P without an IB adapter. Cross-node runs retain IBRC.
+        // Local payloads use P2P. Cross-node runs retain IBRC for host APIs;
+        // NVSHMEM_IB_ENABLE_IBGDA may additionally enable GPU-initiated IB.
         environment("NVSHMEM_REMOTE_TRANSPORT", single_node ? "none" : "ibrc");
-        environment("NVSHMEM_IB_ENABLE_IBGDA", "0");
         environment("NVSHMEM_DISABLE_P2P", single_node ? "0" : "1");
         environment("NVSHMEM_DISABLE_MNNVL", "1");
         environment("NVSHMEM_DISABLE_NCCL", "1");
@@ -188,6 +188,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "rank %d element=%" PRIu64 " block=%" PRIu64
             " multiplier=%" PRIu64 " iterations=%" PRIu64 " validate=%d\n",
             rank, o.element_bytes, o.block_size, o.sm_multiplier, o.iterations, int(o.validate));
+        const char* ibgda_setting = std::getenv("NVSHMEM_IB_ENABLE_IBGDA");
+        std::fprintf(stderr, "rank %d NVSHMEM_IB_ENABLE_IBGDA=%s (verify path in runtime logs)\n",
+                     rank, ibgda_setting ? ibgda_setting : "unset (runtime default)");
         cudaStream_t stream;
         ATLC_CHECK_CUDA(cudaStreamCreate, &stream);
         ATLC_CHECK_CUDA(cudaMemsetAsync, signals, 0, l.signal_bytes, stream);

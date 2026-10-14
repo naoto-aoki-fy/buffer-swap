@@ -435,7 +435,8 @@ a compatible NVSHMEM installation providing `nvshmemx_getmem_block`,
 runs require mutually P2P-accessible GPUs; two-node runs require an active
 InfiniBand fabric. Use a recent NVSHMEM release with the split host/device
 libraries (e.g. 2.8 or later), built with MPI bootstrap and, for two-node runs,
-IBRC support. Match its supported CUDA/driver versions. GPUs must be Volta or newer, support CUDA
+IBRC support and IBGDA support when enabling `NVSHMEM_IB_ENABLE_IBGDA`.
+Match its supported CUDA/driver versions. GPUs must be Volta or newer, support CUDA
 cooperative launch, and be exclusively allocated to these processes.
 
 The NVSHMEM rule currently uses the shared `NVCC_CFLAGS` and `NVCC_LDFLAGS`.
@@ -564,9 +565,11 @@ CUDA_VISIBLE_DEVICES=0,1 NVSHMEM_SYMMETRIC_SIZE=64M \
 
 This mode forces `NVSHMEM_REMOTE_TRANSPORT=none` and
 `NVSHMEM_DISABLE_P2P=0`, overriding inherited settings. It uses GPU P2P
-without requiring an InfiniBand adapter. IBGDA, MNNVL and NCCL collectives
-remain disabled, and the static symmetric heap and GPU swap kernel are the
-same as in two-node mode. After allocating the symmetric buffers, each rank
+without requiring an InfiniBand adapter. MNNVL and NCCL collectives remain disabled.
+`NVSHMEM_IB_ENABLE_IBGDA` is preserved, including in single-node mode; leave
+it unset or set it to `0` to run without an IB adapter. Enabling it requires
+the IBGDA runtime prerequisites even though local payloads use P2P. The static
+symmetric heap and GPU swap kernel are the same as in two-node mode. After allocating the symmetric buffers, each rank
 checks `nvshmem_ptr` for peer access to A, B and the signals before launching
 any swap. Unsupported P2P fails; there is no network fallback in local mode.
 See NVIDIA's [environment settings](https://docs.nvidia.com/nvshmem/api/latest/gen/env.html)
@@ -586,11 +589,20 @@ Initialization passes `MPI_COMM_WORLD` to
 `nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, ...)` and verifies PE IDs.
 
 For two-node runs, the executable forces `NVSHMEM_REMOTE_TRANSPORT=ibrc`,
-disables IBGDA, P2P, MNNVL and NVSHMEM NCCL collectives, and directs debug logs to
-`/dev/stderr`. This deliberately targets the IBRC proxy transport; IBGDA is
-not a selectable benchmark mode. GPU threads still issue every GET and signal;
-NVSHMEM's CPU proxy may progress the verbs operations. Allocate CPU resources
-for that proxy. MPI bootstrap/control traffic may use sockets.
+disables P2P, MNNVL and NVSHMEM NCCL collectives, and directs debug logs to
+`/dev/stderr`. It preserves `NVSHMEM_IB_ENABLE_IBGDA`: set it to `1` on both
+ranks to enable GPU-initiated IBGDA communication, or leave it unset/set it to
+`0` for the default IBRC proxy path. IBGDA is enabled separately from
+`NVSHMEM_REMOTE_TRANSPORT`; keep the latter as `ibrc`. The same GPU kernel
+issues every GET and signal in either mode. IBRC may use a CPU proxy to
+progress verbs operations; allocate CPU resources for that proxy.
+MPI bootstrap/control traffic may use sockets.
+
+IBGDA requires an NVSHMEM build with IBGDA support and a compatible GPU/driver,
+Mellanox HCA, and GPU-memory registration setup. Check the
+[NVIDIA GPUDirect Async prerequisites](https://docs.nvidia.com/nvshmem/api/latest/using.html#using-gpudirect-async-kernel-initiated-communication)
+for your installed release. The benchmark reports the supplied IBGDA setting;
+this alone does not prove that the runtime selected IBGDA.
 
 Verify on **both nodes** that the chosen HCA/port is active and its physical
 link layer is InfiniBand using `ibstat` or `ibv_devinfo`. IB verbs also supports
@@ -602,9 +614,10 @@ export NVSHMEM_SYMMETRIC_SIZE=33G
 export NVSHMEM_HCA_LIST=mlx5_0:1    # Replace with the site's adapter/port
 export NVSHMEM_DEBUG=INFO
 export NVSHMEM_DEBUG_SUBSYS=INIT,TRANSPORT,MEM
+export NVSHMEM_IB_ENABLE_IBGDA=1   # Use 0 for the IBRC proxy path
 mpirun -np 2 --host node-a,node-b --map-by ppr:1:node \
     -x NVSHMEM_SYMMETRIC_SIZE -x NVSHMEM_HCA_LIST \
-    -x NVSHMEM_DEBUG -x NVSHMEM_DEBUG_SUBSYS \
+    -x NVSHMEM_DEBUG -x NVSHMEM_DEBUG_SUBSYS -x NVSHMEM_IB_ENABLE_IBGDA \
     ./bin/nvshmem_swap_bench \
     --a-size 32G --element-bytes 8 --block-size 256 \
     --sm-multiplier 1 --iterations 128 \
@@ -613,7 +626,7 @@ mpirun -np 2 --host node-a,node-b --map-by ppr:1:node \
 
 Adapt MPI flags for your launcher; with scheduler-provided placement, use
 `mpirun -np 2 ./bin/nvshmem_swap_bench ...`. Inspect both ranks' NVSHMEM logs
-for IBRC selection, the intended HCA/port, successful GPU-memory registration,
+for IBRC/IBGDA selection as requested, the intended HCA/port, successful GPU-memory registration,
 and actual remote transport operation. The program reports the **requested**
 transport; it does not claim independent runtime path verification. Confirm
 GPUDirect RDMA using the site's supported `nvidia-peermem` or DMA-BUF setup,
@@ -670,6 +683,8 @@ NVSHMEM_SYMMETRIC_SIZE=64M python3 tests/nvshmem_swap_runtime_test.py \
     ./bin/nvshmem_swap_bench \
     --launcher 'mpirun -np 2 --host node-a,node-b --map-by ppr:1:node -x NVSHMEM_SYMMETRIC_SIZE'
 # Add --sm-multipliers 1,2 if both devices support that cooperative grid.
+# Repeat with NVSHMEM_IB_ENABLE_IBGDA=1 and add
+# -x NVSHMEM_IB_ENABLE_IBGDA to --launcher on an IBGDA-capable cluster.
 ```
 
 For a single-node two-GPU allocation, use the same runner with local placement:
