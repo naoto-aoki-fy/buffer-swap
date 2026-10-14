@@ -156,15 +156,15 @@ int main(int argc, char** argv) {
         nvshmem_swap::check_capacity(l, heap_bytes, free_bytes);
         // A fixed cudaMalloc-backed symmetric heap makes the capacity check
         // meaningful and avoids VMM/registration differences between releases.
-        environment("NVSHMEM_SYMMETRIC_SIZE", std::to_string(heap_bytes).c_str());
-        environment("NVSHMEM_DISABLE_CUDA_VMM", "1");
+        // environment("NVSHMEM_SYMMETRIC_SIZE", std::to_string(heap_bytes).c_str());
+        // environment("NVSHMEM_DISABLE_CUDA_VMM", "1");
         // Local payloads use P2P. Cross-node runs retain IBRC for host APIs;
         // NVSHMEM_IB_ENABLE_IBGDA may additionally enable GPU-initiated IB.
-        environment("NVSHMEM_REMOTE_TRANSPORT", single_node ? "none" : "ibrc");
-        environment("NVSHMEM_DISABLE_P2P", single_node ? "0" : "1");
-        environment("NVSHMEM_DISABLE_MNNVL", "1");
-        environment("NVSHMEM_DISABLE_NCCL", "1");
-        environment("NVSHMEM_DEBUG_FILE", "/dev/stderr");
+        // environment("NVSHMEM_REMOTE_TRANSPORT", single_node ? "none" : "ibrc");
+        // environment("NVSHMEM_DISABLE_P2P", single_node ? "0" : "1");
+        // environment("NVSHMEM_DISABLE_MNNVL", "1");
+        // environment("NVSHMEM_DISABLE_NCCL", "1");
+        // environment("NVSHMEM_DEBUG_FILE", "/dev/stderr");
         MPI_Comm comm = MPI_COMM_WORLD;
 #ifdef NVSHMEMX_INIT_ATTR_INITIALIZER
         nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
