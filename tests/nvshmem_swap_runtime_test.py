@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Requires two separately allocated CUDA/IB nodes and a built executable."""
+"""Requires a two-GPU P2P node or two CUDA/IB nodes and a built executable."""
 import argparse
 import csv
 import io
@@ -60,7 +60,7 @@ def main():
                     assert 'rank 0: warm-up and all timed swaps validated' in result.stderr
                     assert 'rank 1: warm-up and all timed swaps validated' in result.stderr
                     cases += 1
-    print(f'{cases} two-node NVSHMEM validation/CSV cases passed')
+    print(f'{cases} NVSHMEM validation/CSV cases passed')
 
 
 if __name__ == '__main__':

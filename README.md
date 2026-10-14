@@ -403,11 +403,11 @@ This repository is based on results obtained from a project, JPNP20017,
 commissioned by the New Energy and Industrial Technology Development
 Organization (NEDO).
 
-## Two-node NVSHMEM GPU buffer-swap benchmark
+## NVSHMEM GPU buffer-swap benchmark
 
 `bin/nvshmem_swap_bench` is an additional executable that exchanges all of A
-between exactly two GPUs on separate nodes. MPI handles setup, iteration
-barriers, and timing aggregation. All measured payload transfers and peer
+between exactly two GPUs in one node or on separate nodes. MPI handles setup,
+iteration barriers, and timing aggregation. All measured payload transfers and peer
 notifications use GPU-side NVSHMEM. The existing benchmark sources and default
 build target are unchanged.
 
@@ -416,10 +416,11 @@ build target are unchanged.
 Use the same `nvcc`, `nvccoptions`, `atlc`, Makefile and `config.mk` workflow.
 Requirements are 64-bit Linux, CUDA/cuRAND, MPI with shared-node communicators,
 a compatible NVSHMEM installation providing `nvshmemx_getmem_block`,
-`nvshmemx_signal_op`, MPI interoperability and collective launch, and an active
+`nvshmemx_signal_op`, MPI interoperability and collective launch. Single-node
+runs require mutually P2P-accessible GPUs; two-node runs require an active
 InfiniBand fabric. Use a recent NVSHMEM release with the split host/device
-libraries (e.g. 2.8 or later), built with MPI bootstrap and IBRC support. Match
-its supported CUDA/driver versions. GPUs must be Volta or newer, support CUDA
+libraries (e.g. 2.8 or later), built with MPI bootstrap and, for two-node runs,
+IBRC support. Match its supported CUDA/driver versions. GPUs must be Volta or newer, support CUDA
 cooperative launch, and be exclusively allocated to these processes.
 
 For example, add these site-specific settings to `config.mk`:
@@ -440,8 +441,9 @@ installation-specific NVSHMEM dependencies (such as `-lmlx5` if required by
 that build). Obtain compiler flags using `nvccoptions` as usual. The single
 `nvcc` invocation with `-rdc=true` compiles and device-links the kernel against
 `libnvshmem_device.a`; retain this flag when overriding `NVSHMEM_CFLAGS`.
-The target reuses `NVCC_CFLAGS`, but uses separate NVSHMEM/MPI library settings
-rather than `LDLIBS` or `LDFLAGS_VENDOR`, avoiding an NCCL link dependency.
+The target reuses `NVCC_CFLAGS` and uses the NVSHMEM-specific library settings
+above instead of `LDLIBS`. `NVSHMEM_MPI_LDFLAGS` defaults to `LDFLAGS_VENDOR`;
+set it explicitly to MPI-only flags if the vendor flags include NCCL libraries.
 NVSHMEM-specific flags apply only to this target. Set runtime library paths
 for CUDA, MPI, NVSHMEM and its bootstrap/transport plugins using modules or
 `LD_LIBRARY_PATH` on both nodes. MPI must match the NVSHMEM MPI bootstrap build.
@@ -450,7 +452,7 @@ for CUDA, MPI, NVSHMEM and its bootstrap/transport plugins using modules or
 make bin/nvshmem_swap_bench
 ```
 
-`NVSHMEM_BIN` overrides the executable path; `make clean` removes it too.
+`NVSHMEM_BENCH_BIN` overrides the executable path; `make clean` removes it too.
 See NVIDIA's [NVSHMEM compilation and MPI interoperability guide](https://docs.nvidia.com/nvshmem/api/latest/using.html).
 
 ### Memory and options
@@ -524,15 +526,49 @@ the queried maximum grid prevents waiting blocks from blocking unlaunched peers.
 See [NVIDIA's collective-launch requirements](https://docs.nvidia.com/nvshmem/api/latest/api/launch.html)
 and [memory-ordering rules](https://docs.nvidia.com/nvshmem/api/latest/gen/api/ordering.html).
 
-### Launch and verify InfiniBand
+### Launch on one node with two GPUs
+
+Use exactly two MPI ranks on the same node, one per GPU. With the same ordered
+`CUDA_VISIBLE_DEVICES` list visible to both processes, local rank 0 selects
+device 0 and local rank 1 selects device 1. When the scheduler exposes just
+one assigned GPU per process, each selects its visible device 0. GPU UUIDs
+are checked to reject duplicate assignments. Both GPUs must have the same
+SM count and support the selected cooperative launch grid, as in two-node runs.
+
+For example, with Open MPI:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 NVSHMEM_SYMMETRIC_SIZE=64M \
+    mpirun -np 2 --map-by ppr:2:node \
+    ./bin/nvshmem_swap_bench -a 1M -e 8 -t 256 -m 1 -n 3 --validate \
+    > results.csv 2> diagnostics.log
+```
+
+This mode forces `NVSHMEM_REMOTE_TRANSPORT=none` and
+`NVSHMEM_DISABLE_P2P=0`, overriding inherited settings. It uses GPU P2P
+without requiring an InfiniBand adapter. IBGDA, MNNVL and NCCL collectives
+remain disabled, and the static symmetric heap and GPU swap kernel are the
+same as in two-node mode. After allocating the symmetric buffers, each rank
+checks `nvshmem_ptr` for peer access to A, B and the signals before launching
+any swap. Unsupported P2P fails; there is no network fallback in local mode.
+See NVIDIA's [environment settings](https://docs.nvidia.com/nvshmem/api/latest/gen/env.html)
+and [P2P-access query documentation](https://docs.nvidia.com/nvshmem/api/latest/faq.html).
+
+Inspect GPU topology and NVSHMEM logs to establish the actual path. P2P
+access alone does not establish NVLink use. Use a GPU pair and NVSHMEM release
+that support the kernel's GET, signal SET and wait operations over P2P.
+The configured symmetric heap must fit on each GPU; all buffer, SM-count,
+launch-capacity, timing, validation and CSV requirements still apply.
+
+### Launch on two nodes and verify InfiniBand
 
 Each process chooses CUDA device ordinal 0 relative to `CUDA_VISIBLE_DEVICES`.
-Use exactly one rank per node and expose its assigned GPU. Same-node placement
-is rejected with `MPI_Comm_split_type`. Initialization passes `MPI_COMM_WORLD`
-to `nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, ...)` and verifies PE IDs.
+Use exactly one rank per node and expose its assigned GPU.
+Initialization passes `MPI_COMM_WORLD` to
+`nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, ...)` and verifies PE IDs.
 
-The executable forces `NVSHMEM_REMOTE_TRANSPORT=ibrc`, disables IBGDA, P2P,
-MNNVL and NVSHMEM NCCL collectives, and directs NVSHMEM debug logs to
+For two-node runs, the executable forces `NVSHMEM_REMOTE_TRANSPORT=ibrc`,
+disables IBGDA, P2P, MNNVL and NVSHMEM NCCL collectives, and directs debug logs to
 `/dev/stderr`. This deliberately targets the IBRC proxy transport; IBGDA is
 not a selectable benchmark mode. GPU threads still issue every GET and signal;
 NVSHMEM's CPU proxy may progress the verbs operations. Allocate CPU resources
@@ -618,11 +654,19 @@ NVSHMEM_SYMMETRIC_SIZE=64M python3 tests/nvshmem_swap_runtime_test.py \
 # Add --sm-multipliers 1,2 if both devices support that cooperative grid.
 ```
 
+For a single-node two-GPU allocation, use the same runner with local placement:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 NVSHMEM_SYMMETRIC_SIZE=64M \
+    python3 tests/nvshmem_swap_runtime_test.py ./bin/nvshmem_swap_bench \
+    --launcher 'mpirun -np 2 --map-by ppr:2:node'
+```
+
 The runner checks both ranks' validation of repeated swaps for all widths,
 several block sizes, sub-element tails, exact chunks, many rounds, CSV schema
 and row count, invalid options, oversized allocation and launch requests.
-Also verify one/three ranks, same-node placement, differing rank options/SM
-counts, unavailable HCAs, and a heap exceeding available GPU memory fail
-with diagnostics. These cluster checks, real CUDA device linking, event timing,
+Also verify one/three ranks, duplicate GPU assignments, unavailable local P2P,
+differing rank options/SM counts, unavailable HCAs in two-node mode, and a heap
+exceeding available GPU memory fail with diagnostics. These cluster checks, real CUDA device linking, event timing,
 32 GiB allocation and InfiniBand/GDR verification require the target hardware;
 host-only tests cannot establish them.

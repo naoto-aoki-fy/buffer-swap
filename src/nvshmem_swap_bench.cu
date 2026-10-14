@@ -20,7 +20,7 @@ static void check_nvshmem(int status, const char* operation) {
 }
 static void usage() {
     std::fprintf(stderr,
-        "Usage: nvshmem_swap_bench [options] (two ranks on separate nodes)\n"
+        "Usage: nvshmem_swap_bench [options] (exactly two ranks, one GPU per rank)\n"
         "  -a, --a-size SIZE       A bytes per GPU (default 32G)\n"
         "  -e, --element-bytes N   1, 2, 4 or 8 (default 8)\n"
         "  -t, --block-size N      Threads per block (default 256)\n"
@@ -109,13 +109,30 @@ int main(int argc, char** argv) {
         MPI_Comm local;
         ATLC_CHECK_MPI(MPI_Comm_split_type, MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED,
                        rank, MPI_INFO_NULL, &local);
-        int local_size;
+        int local_size, local_rank;
         ATLC_CHECK_MPI(MPI_Comm_size, local, &local_size);
-        ATLC_CHECK_MPI(MPI_Comm_free, &local);
-        if (local_size != 1) throw std::runtime_error("place one rank on each of two separate nodes");
-        ATLC_CHECK_CUDA(cudaSetDevice, 0);
+        ATLC_CHECK_MPI(MPI_Comm_rank, local, &local_rank);
+        const bool single_node = local_size == 2;
+        int devices;
+        ATLC_CHECK_CUDA(cudaGetDeviceCount, &devices);
+        if (!devices) throw std::runtime_error("no visible CUDA device");
+        // Use scheduler-assigned device 0 if only one GPU is visible; otherwise
+        // local ranks must see the same ordered CUDA_VISIBLE_DEVICES list.
+        const int device = devices == 1 ? 0 : local_rank;
+        if (device >= devices)
+            throw std::runtime_error("not enough visible CUDA devices for local MPI ranks");
+        ATLC_CHECK_CUDA(cudaSetDevice, device);
         cudaDeviceProp prop;
-        ATLC_CHECK_CUDA(cudaGetDeviceProperties, &prop, 0);
+        ATLC_CHECK_CUDA(cudaGetDeviceProperties, &prop, device);
+        // Ordinals are process-relative; UUIDs detect duplicate GPU assignments.
+        std::vector<cudaUUID_t> local_uuids(local_size);
+        ATLC_CHECK_MPI(MPI_Allgather, &prop.uuid, int(sizeof(cudaUUID_t)), MPI_BYTE,
+                       local_uuids.data(), int(sizeof(cudaUUID_t)), MPI_BYTE, local);
+        ATLC_CHECK_MPI(MPI_Comm_free, &local);
+        if (single_node &&
+            std::equal(local_uuids[0].bytes, local_uuids[0].bytes + sizeof(local_uuids[0].bytes),
+                       local_uuids[1].bytes))
+            throw std::runtime_error("local ranks must use distinct GPUs; check CUDA_VISIBLE_DEVICES");
         if (!prop.cooperativeLaunch || prop.major < 7)
             throw std::runtime_error("NVSHMEM synchronization requires a Volta-or-newer GPU with cooperative launch");
         const auto l = nvshmem_swap::layout(o, prop.multiProcessorCount,
@@ -131,9 +148,10 @@ int main(int argc, char** argv) {
         // meaningful and avoids VMM/registration differences between releases.
         environment("NVSHMEM_SYMMETRIC_SIZE", std::to_string(heap_bytes).c_str());
         environment("NVSHMEM_DISABLE_CUDA_VMM", "1");
-        environment("NVSHMEM_REMOTE_TRANSPORT", "ibrc");
+        // Local runs use P2P without an IB adapter. Cross-node runs retain IBRC.
+        environment("NVSHMEM_REMOTE_TRANSPORT", single_node ? "none" : "ibrc");
         environment("NVSHMEM_IB_ENABLE_IBGDA", "0");
-        environment("NVSHMEM_DISABLE_P2P", "1");
+        environment("NVSHMEM_DISABLE_P2P", single_node ? "0" : "1");
         environment("NVSHMEM_DISABLE_MNNVL", "1");
         environment("NVSHMEM_DISABLE_NCCL", "1");
         environment("NVSHMEM_DEBUG_FILE", "/dev/stderr");
@@ -152,14 +170,21 @@ int main(int argc, char** argv) {
         auto* signals = static_cast<uint64_t*>(nvshmem_malloc(l.signal_bytes));
         if (!a || !b || !signals)
             throw std::runtime_error("NVSHMEM symmetric allocation failed; increase heap capacity/free GPU memory");
+        // Fail before launching a waiting kernel if either PE cannot map the
+        // peer's symmetric buffers through the selected local P2P transport.
+        if (single_node && (!nvshmem_ptr(a, 1 - rank) ||
+                            !nvshmem_ptr(b, 1 - rank) ||
+                            !nvshmem_ptr(signals, 1 - rank)))
+            throw std::runtime_error("single-node runs require NVSHMEM P2P access between both GPUs");
         char hostname[MPI_MAX_PROCESSOR_NAME] = {};
         int hostname_length;
         ATLC_CHECK_MPI(MPI_Get_processor_name, hostname, &hostname_length);
-        std::fprintf(stderr, "rank %d host %.*s GPU 0 %s SMs=%d blocks=%" PRIu64
+        std::fprintf(stderr, "rank %d host %.*s GPU %d %s SMs=%d blocks=%" PRIu64
             " A=%zu B=%" PRIu64 " chunk=%" PRIu64 " heap=%" PRIu64
-            "; requested transport=ibrc (verify IB/GDR in runtime logs)\n",
-            rank, hostname_length, hostname, prop.name, prop.multiProcessorCount,
-            l.grid_blocks, o.a_size, l.b_bytes, l.chunk_bytes, heap_bytes);
+            "; placement=%s; requested transport=%s (verify path in runtime logs)\n",
+            rank, hostname_length, hostname, device, prop.name, prop.multiProcessorCount,
+            l.grid_blocks, o.a_size, l.b_bytes, l.chunk_bytes, heap_bytes,
+            single_node ? "single-node" : "two-node", single_node ? "P2P" : "ibrc");
         std::fprintf(stderr, "rank %d element=%" PRIu64 " block=%" PRIu64
             " multiplier=%" PRIu64 " iterations=%" PRIu64 " validate=%d\n",
             rank, o.element_bytes, o.block_size, o.sm_multiplier, o.iterations, int(o.validate));
