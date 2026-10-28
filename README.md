@@ -344,6 +344,8 @@ Launch directly, without a multi-process launcher:
 | `-a`, `--a-size SIZE` | A bytes **per GPU** | `32G` (32 GiB) |
 | `-e`, `--element-bytes N` | Unsigned typed access width: 1, 2, 4 or 8 bytes | `8` |
 | `-t`, `--block-size N` | CUDA threads per block | `256` |
+| `--grid-stride` | Use a bounded grid with thread reuse | Disabled (reference kernel) |
+| `-m`, `--sm-multiplier N` | Block cap per SM in grid-stride mode | `4` |
 | `-n`, `--iterations N` | Timed complete swaps | `128` |
 | `--validate` | Compare both buffers after warm-up and every timed swap | Disabled |
 | `-h`, `--help` | Print help to stderr without accessing CUDA | |
@@ -351,11 +353,35 @@ Launch directly, without a multi-process launcher:
 Sizes use the existing positive decimal and binary K/M/G suffix conventions.
 A must be divisible by the element width. Other widths, zero, signs, overflow,
 unknown options, missing arguments and positional arguments are rejected.
-Block size is checked against GPU 0's thread and block-x limits. The grid is
-`floor((A bytes / element bytes) / block size) + 1`, enforcing the strict
-inequality `block_size * grid_size * element_bytes > A bytes`, even for exact
+Block size is checked against GPU 0's thread and block-x limits. The default
+reference kernel uses `floor((A bytes / element bytes) / block size) + 1`,
+enforcing the strict inequality `block_size * grid_size * element_bytes > A bytes`, even for exact
 multiples. Grid limits and 64-bit coverage overflow are checked before launch.
 All index arithmetic is 64-bit; surplus threads are bounds checked.
+
+Add `--grid-stride` to select the alternative kernel. Its grid is the minimum of
+`ceil(elements / block_size)`, `GPU_0_SM_count * sm_multiplier`, and the hardware
+and launch-dimension grid limits. Each thread swaps successive elements spaced
+by `grid_size * block_size`, preserving adjacent-thread contiguous accesses.
+Small buffers launch only the blocks needed. The SM multiplier must be positive;
+its product with the SM count is checked for overflow. It affects only this mode.
+The kernel uses 64-bit indices and guards the final stride against wraparound.
+
+For example, compare the reference run above with several grid caps:
+
+```bash
+for multiplier in 1 2 4 8; do
+    ./bin/uva_swap_bench --grid-stride --sm-multiplier "$multiplier" \
+        --a-size 32G --element-bytes 8 --block-size 256 --iterations 128 \
+        > "grid-stride-${multiplier}.csv" 2> "grid-stride-${multiplier}.log"
+done
+```
+
+At 80 SMs and multiplier 4, the default buffer uses 320 blocks instead of
+16,777,217. The multiplier default is a starting point for tuning; measure on the
+target GPU pair because too few blocks can reduce remote-memory latency hiding.
+Diagnostics record the kernel mode, SM count, multiplier, and actual grid; the
+CSV schema remains the same for both modes.
 
 Each buffer is allocated with `cudaMalloc` and initialized with cuRAND using
 different seeds. For 1/2-byte sizes, a cuRAND device kernel fills any trailing
@@ -399,7 +425,8 @@ g++ -std=c++17 -Wall -Wextra -Werror -Iinclude tests/uva_p2p_options_test.cpp -o
 ```
 
 The new suite checks defaults, all element widths, parsing errors, divisibility,
-validation bounds, strict grid coverage, hardware limits and arithmetic overflow.
+validation bounds, reference grid coverage, bounded grid caps, hardware limits
+and arithmetic overflow.
 On the actual two-GPU system, after verifying NVLink topology, run:
 
 ```bash
@@ -407,8 +434,9 @@ python3 tests/uva_p2p_runtime_test.py ./bin/uva_swap_bench
 ```
 
 This integration test validates both GPUs across repeated swaps for every
-supported width, sub-word initialization, exact and partial blocks, and tiny
-buffers. It also checks help/errors and the CSV schema and row counts. GPU
+supported width in both modes, sub-word initialization, exact and partial
+blocks, tiny buffers, and multiple grid-stride passes at different SM multipliers.
+It also checks help/errors and the CSV schema and row counts. GPU
 correctness, event timing, allocation at 32 GiB, and NVLink transport require
 the actual CUDA toolkit and two-GPU hardware; host tests cannot verify them.
 

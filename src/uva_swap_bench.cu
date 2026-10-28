@@ -16,6 +16,8 @@ static void usage() {
         "  -a, --a-size SIZE       Buffer bytes per GPU (default 32G)\n"
         "  -e, --element-bytes N   Typed element size: 1, 2, 4, 8 (default 8)\n"
         "  -t, --block-size N      Threads per block (default 256)\n"
+        "      --grid-stride       Use the bounded grid-stride kernel (default off)\n"
+        "  -m, --sm-multiplier N   Grid-stride block cap per SM (default 4)\n"
         "  -n, --iterations N      Timed swaps (default 128)\n"
         "      --validate          Compare all bytes after every swap; A <= 16M\n"
         "  -h, --help              Show this help on stderr\n"
@@ -62,19 +64,41 @@ __global__ void swap_buffers(T* a0, T* a1, uint64_t elements) {
     }
 }
 
+template <typename T>
+__global__ void swap_buffers_grid_stride(T* a0, T* a1, uint64_t elements) {
+    const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < elements; i += stride) {
+        const T local = a0[i];
+        const T remote = a1[i];
+        a0[i] = remote;
+        a1[i] = local;
+        if (stride >= elements - i) break; // Avoid 64-bit index wraparound.
+    }
+}
+
+template <typename T>
+static void launch_swap(unsigned char* a0, unsigned char* a1, uint64_t elements,
+                        unsigned grid, unsigned block, bool grid_stride,
+                        cudaStream_t stream) {
+    if (grid_stride)
+        swap_buffers_grid_stride<<<grid, block, 0, stream>>>(
+            reinterpret_cast<T*>(a0), reinterpret_cast<T*>(a1), elements);
+    else
+        swap_buffers<<<grid, block, 0, stream>>>(
+            reinterpret_cast<T*>(a0), reinterpret_cast<T*>(a1), elements);
+}
+
 static void exchange(unsigned char* a0, unsigned char* a1,
                      const uva_p2p::Options& options, unsigned grid,
                      cudaStream_t stream) {
     const uint64_t elements = options.a_size / options.element_bytes;
     const unsigned block = static_cast<unsigned>(options.block_size);
     switch (options.element_bytes) {
-        case 1: swap_buffers<<<grid, block, 0, stream>>>(a0, a1, elements); break;
-        case 2: swap_buffers<<<grid, block, 0, stream>>>(
-            reinterpret_cast<uint16_t*>(a0), reinterpret_cast<uint16_t*>(a1), elements); break;
-        case 4: swap_buffers<<<grid, block, 0, stream>>>(
-            reinterpret_cast<uint32_t*>(a0), reinterpret_cast<uint32_t*>(a1), elements); break;
-        case 8: swap_buffers<<<grid, block, 0, stream>>>(
-            reinterpret_cast<uint64_t*>(a0), reinterpret_cast<uint64_t*>(a1), elements); break;
+        case 1: launch_swap<uint8_t>(a0, a1, elements, grid, block, options.grid_stride, stream); break;
+        case 2: launch_swap<uint16_t>(a0, a1, elements, grid, block, options.grid_stride, stream); break;
+        case 4: launch_swap<uint32_t>(a0, a1, elements, grid, block, options.grid_stride, stream); break;
+        case 8: launch_swap<uint64_t>(a0, a1, elements, grid, block, options.grid_stride, stream); break;
     }
     ATLC_CHECK_CUDA(cudaGetLastError);
 }
@@ -114,7 +138,7 @@ int main(int argc, char** argv) {
         }
         const uint64_t grid = uva_p2p::grid_size(options,
             properties[0].maxThreadsPerBlock, properties[0].maxThreadsDim[0],
-            properties[0].maxGridSize[0]);
+            properties[0].maxGridSize[0], properties[0].multiProcessorCount);
         // Only GPU 0 accesses peer memory. GPU 1 never accesses GPU 0's buffer.
         int accessible;
         ATLC_CHECK_CUDA(cudaDeviceCanAccessPeer, &accessible, 0, 1);
@@ -128,6 +152,10 @@ int main(int argc, char** argv) {
             "A=%zu bytes per GPU, element=%" PRIu64 ", block=%" PRIu64
             ", grid=%" PRIu64 ", iterations=%" PRIu64 "\n",
             options.a_size, options.element_bytes, options.block_size, grid, options.iterations);
+        std::fprintf(stderr, "kernel=%s, SMs=%d, sm_multiplier=%" PRIu64
+            " (used only in grid-stride mode)\n",
+            options.grid_stride ? "grid-stride" : "reference",
+            properties[0].multiProcessorCount, options.sm_multiplier);
 
         unsigned char* a[2];
         cudaStream_t streams[2];
