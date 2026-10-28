@@ -3,9 +3,12 @@
 `bin/nccl_swap_bench` is a two-rank GPU communication benchmark for two GPUs
 in one node or separate compute nodes connected by InfiniBand. Each rank owns
 a main GPU buffer A and a smaller receive buffer B. Consecutive chunks of A are sent to the peer using
-grouped `ncclSend`/`ncclRecv`; received chunks are copied from B into A on the
-same CUDA stream. The final chunk can be smaller than B. Only these two data
-buffers are allocated, using `cudaMalloc` and initialized with cuRAND.
+grouped `ncclSend`/`ncclRecv` on one communication stream. B is split into two
+staging slots of `floor(B / 2)` bytes, and a separate copy stream writes received
+chunks into A while communication proceeds into the other slot. Events protect
+the outgoing A data and prevent slot reuse until its previous copy finishes.
+The final chunk can be smaller than a slot. Only these two data buffers are
+allocated, using `cudaMalloc` and initialized with cuRAND.
 
 ## Build
 
@@ -58,10 +61,10 @@ three configured executable paths.
 | Option | Meaning | Default |
 |---|---|---|
 | `-a`, `--a-size SIZE` | A size in bytes | `32G` (32 GiB) |
-| `-b`, `--b-size SIZE` | B size in bytes | `1G` (1 GiB) |
+| `-b`, `--b-size SIZE` | Total B size in bytes (two staging slots in copy mode) | `1G` (1 GiB) |
 | `-n`, `--iterations N` | Number of timed full-A exchanges | `128` |
 | `--skip-copy-back` | Omit B-to-A device copies; A remains unchanged | Disabled |
-| `--validate` | Compare every byte of A after each timed iteration | Disabled |
+| `--validate` | Compare every byte of A after warm-up and each timed iteration | Disabled |
 | `-h`, `--help` | Print help to stderr and exit | |
 
 Sizes are positive decimal integers with optional case-insensitive `K`, `M`
@@ -73,6 +76,14 @@ options. `--validate` limits each buffer to 16 MiB to keep host reference
 storage bounded. The default buffers require **33 GiB free GPU memory per
 rank plus CUDA/cuRAND/NCCL overhead**; reduce the sizes for smaller GPUs.
 Allocation errors and insufficient memory abort the MPI job.
+
+The two slots share the existing B allocation: default B=1 GiB gives two
+512 MiB slots. Odd B sizes leave one byte unused. B=1 falls back to serial
+one-byte transfers and copies on the communication stream. `--skip-copy-back`
+uses all of B as a single receive slot, with no copy stream. Each rank reports
+the effective slot count and chunk size on stderr. Compared with the former
+serial implementation at the same total B, the pipeline uses smaller chunks;
+measure performance on the target hardware rather than assuming a speedup.
 
 ## Launch on two nodes
 
@@ -194,8 +205,10 @@ for network selection, logging, HCA filters and prerequisites.
 Allocation, cuRAND initialization, communicator setup and one untimed full-A
 warm-up exchange run before timing. The warm-up follows the chosen copy mode;
 in normal mode it swaps A once. Each timed iteration synchronizes ranks with
-an MPI barrier, then records start and stop CUDA events on the single stream
-around the entire chunk loop. The stop event is synchronized before reading
+an MPI barrier, then records start and stop CUDA events on the communication
+stream around the entire chunk loop. This stream waits for the final copy-back
+before recording stop, so timing includes both streams and pipeline draining.
+The stop event is synchronized before reading
 `cudaEventElapsedTime`. MPI reduces the two local event times with `MPI_MAX`
 after the stop event; rank 0 reports that maximum in milliseconds.
 
@@ -204,7 +217,7 @@ A equal to the peer's A from the beginning of that iteration. Successive
 iterations alternate the two contents. `--skip-copy-back` includes only NCCL
 communication: each chunk is received into B and overwritten by the next,
 while A remains unchanged. A full iteration sends A bytes and receives A bytes
-per rank in both modes. Timings cover execution on the stream, including
+per rank in both modes. Timings cover execution on the streams, including
 waiting and any gaps in enqueueing; they are not isolated link latency or
 MPI wall-clock timings. Diagnostic logging can affect measurements, so use
 INFO to verify the transport, then lower verbosity for production runs.
@@ -224,10 +237,10 @@ CSV and stderr to a diagnostics file.
 
 ## Validation
 
-`--validate` snapshots each rank's post-warm-up A on the host and exchanges
-bounded reference snapshots with MPI outside timing. After every timed
-iteration it compares all bytes of A to the expected peer snapshot (odd
-exchange count) or local snapshot (even exchange count). Skip mode always
+`--validate` snapshots each rank's initial A on the host and exchanges bounded
+reference snapshots with MPI outside timing. It checks warm-up and every timed
+iteration against the expected peer snapshot (odd total exchange count,
+including warm-up) or local snapshot (even total exchange count). Skip mode always
 compares against the local snapshot. Validation copies and comparisons are
 outside the CUDA-event interval and allocate no extra GPU data buffer.
 Any mismatch aborts the job; successful checks are reported on stderr.
@@ -266,6 +279,26 @@ validation bounds, invalid options, missing arguments, unsigned integer
 limits, size multiplication overflow and combined allocation overflow.
 GPU correctness, timing and transport verification require the actual
 CUDA/NCCL/MPI and either a two-GPU node or two-node InfiniBand environment.
+
+The NCCL runtime suite covers one/two/three chunks, repeated slot reuse, odd
+sizes, partial tails, B>A, B=1, skip-copy mode, and both iteration parities.
+It validates warm-up and every timed exchange, and checks CSV output:
+
+```bash
+python3 tests/nccl_swap_runtime_test.py ./bin/nccl_swap_bench \
+    --launcher 'mpirun -np 2' --stress-iterations 128
+# Exercise the same production exchange with delayed rank submissions and copies.
+make bin/nccl_swap_skew_test
+python3 tests/nccl_swap_runtime_test.py ./bin/nccl_swap_skew_test \
+    --launcher 'mpirun -np 2' --stress-only --stress-iterations 128
+```
+
+Supply the appropriate placement/environment flags in `--launcher` for local
+or two-node tests. The skew binary is only a correctness test; do not use its
+timings as performance measurements. Use a GPU timeline on representative runs
+to verify actual communication/copy overlap and compare with the serial baseline
+at the same total B. Skip-copy timings use different chunk sizes and do not
+isolate the cost of copying.
 
 ## Single-process UVA/P2P buffer swap benchmark
 

@@ -22,10 +22,10 @@ static void usage() {
     std::fprintf(stderr,
         "Usage: nccl_swap_bench [options] (exactly two ranks, one GPU per rank)\n"
         "  -a, --a-size SIZE       Main buffer bytes (default 32G)\n"
-        "  -b, --b-size SIZE       Receive buffer bytes (default 1G)\n"
+        "  -b, --b-size SIZE       Total staging bytes, split into two slots (default 1G)\n"
         "  -n, --iterations N      Timed exchanges (default 128)\n"
         "      --skip-copy-back    Leave A unchanged; omit B-to-A copies\n"
-        "      --validate          Compare every byte after each iteration; A/B <= 16M\n"
+        "      --validate          Check warm-up and every iteration; A/B <= 16M\n"
         "  -h, --help              Show this help on stderr\n"
         "SIZE is a positive integer with optional K/M/G suffix (binary units).\n");
 }
@@ -56,21 +56,52 @@ static void initialize(unsigned char* data, size_t bytes,
     }
 }
 
+struct ExchangePipeline {
+    cudaStream_t copy_stream{};
+    cudaEvent_t transfer_done[2]{};
+    cudaEvent_t copy_done[2]{};
+};
+
 static void exchange(unsigned char* a, unsigned char* b,
                      const bench::Options& options, int rank,
-                     ncclComm_t comm, cudaStream_t stream) {
+                     ncclComm_t comm, cudaStream_t stream,
+                     const ExchangePipeline& pipeline) {
+    // Keep the total B allocation fixed. An odd B leaves one byte unused.
+    // B=1 cannot hold two slots; skip-copy mode needs no copy pipeline.
+    const bool pipelined = options.copy_back && options.b_size >= 2;
+    const size_t chunk_size = pipelined ? options.b_size / 2 : options.b_size;
+    bool used[2] = {};
+    unsigned slot = 0;
     for (size_t offset = 0; offset < options.a_size;) {
-        const size_t bytes = std::min(options.b_size, options.a_size - offset);
+        const size_t bytes = std::min(chunk_size, options.a_size - offset);
+        unsigned char* receive = b + slot * chunk_size;
+        if (pipelined && used[slot])
+            ATLC_CHECK_CUDA(cudaStreamWaitEvent, stream, pipeline.copy_done[slot], 0);
         ATLC_CHECK_NCCL(ncclGroupStart);
         ATLC_CHECK_NCCL(ncclSend, a + offset, bytes, ncclUint8, 1 - rank, comm, stream);
-        ATLC_CHECK_NCCL(ncclRecv, b, bytes, ncclUint8, 1 - rank, comm, stream);
+        ATLC_CHECK_NCCL(ncclRecv, receive, bytes, ncclUint8, 1 - rank, comm, stream);
         ATLC_CHECK_NCCL(ncclGroupEnd);
-        // Stream order protects both the outgoing chunk and B before reuse.
-        if (options.copy_back)
-            ATLC_CHECK_CUDA(cudaMemcpyAsync, a + offset, b, bytes,
+        if (pipelined) {
+            // Both send and receive must finish before overwriting this A chunk.
+            ATLC_CHECK_CUDA(cudaEventRecord, pipeline.transfer_done[slot], stream);
+            ATLC_CHECK_CUDA(cudaStreamWaitEvent, pipeline.copy_stream,
+                            pipeline.transfer_done[slot], 0);
+            ATLC_CHECK_CUDA(cudaMemcpyAsync, a + offset, receive, bytes,
+                            cudaMemcpyDeviceToDevice, pipeline.copy_stream);
+            ATLC_CHECK_CUDA(cudaEventRecord, pipeline.copy_done[slot], pipeline.copy_stream);
+            used[slot] = true;
+            slot ^= 1;
+        } else if (options.copy_back) {
+            ATLC_CHECK_CUDA(cudaMemcpyAsync, a + offset, receive, bytes,
                             cudaMemcpyDeviceToDevice, stream);
+        }
         offset += bytes;
     }
+    // Join the copy stream so warm-up synchronization, the timed stop event,
+    // and any subsequent exchange include every copy. Stream order means the
+    // last copy also covers all earlier copies, including the other slot.
+    if (pipelined)
+        ATLC_CHECK_CUDA(cudaStreamWaitEvent, stream, pipeline.copy_done[slot ^ 1], 0);
 }
 
 int main(int argc, char** argv) {
@@ -136,6 +167,9 @@ int main(int argc, char** argv) {
                      rank, hostname_length, hostname, device, properties.name,
                      options.a_size, options.b_size, int(options.copy_back),
                      local_size == 2 ? "single-node" : "two-node");
+        const bool pipelined = options.copy_back && options.b_size >= 2;
+        std::fprintf(stderr, "rank %d: staging_slots=%d chunk_bytes=%zu\n", rank,
+                     pipelined ? 2 : 1, pipelined ? options.b_size / 2 : options.b_size);
 
         // Cross-node runs force IB; local runs let NCCL select P2P/SHM
         // without requiring an IB adapter. Keep NCCL logs off CSV stdout.
@@ -153,6 +187,14 @@ int main(int argc, char** argv) {
         ATLC_CHECK_NCCL(ncclCommInitRank, &comm, 2, id, rank);
         cudaStream_t stream;
         ATLC_CHECK_CUDA(cudaStreamCreate, &stream);
+        ExchangePipeline pipeline;
+        if (pipelined) {
+            ATLC_CHECK_CUDA(cudaStreamCreateWithFlags, &pipeline.copy_stream, cudaStreamNonBlocking);
+            for (unsigned slot = 0; slot < 2; ++slot) {
+                ATLC_CHECK_CUDA(cudaEventCreateWithFlags, &pipeline.transfer_done[slot], cudaEventDisableTiming);
+                ATLC_CHECK_CUDA(cudaEventCreateWithFlags, &pipeline.copy_done[slot], cudaEventDisableTiming);
+            }
+        }
         size_t free_bytes, total_bytes;
         ATLC_CHECK_CUDA(cudaMemGetInfo, &free_bytes, &total_bytes);
         if (options.a_size + options.b_size > free_bytes)
@@ -168,12 +210,6 @@ int main(int argc, char** argv) {
         ATLC_CHECK_CUDA(cudaStreamSynchronize, stream);
         ATLC_CHECK_CURAND(curandDestroyGenerator, rng);
 
-        // Establish lazy NCCL connections outside the measured iterations.
-        // Warm-up follows the chosen copy mode, so skip mode leaves A intact.
-        ATLC_CHECK_MPI(MPI_Barrier, MPI_COMM_WORLD);
-        exchange(a, b, options, rank, comm, stream);
-        ATLC_CHECK_CUDA(cudaStreamSynchronize, stream);
-
         // Validation uses bounded host snapshots only as references. The actual
         // exchange always uses NCCL GPU buffers, including in validation mode.
         std::vector<unsigned char> original, peer_original, actual;
@@ -187,6 +223,17 @@ int main(int argc, char** argv) {
                            1 - rank, 0, peer_original.data(), int(options.a_size), MPI_BYTE,
                            1 - rank, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         }
+        // Establish lazy NCCL connections outside the measured iterations.
+        // Validate warm-up against the initial data, before it can mask errors.
+        ATLC_CHECK_MPI(MPI_Barrier, MPI_COMM_WORLD);
+        exchange(a, b, options, rank, comm, stream, pipeline);
+        ATLC_CHECK_CUDA(cudaStreamSynchronize, stream);
+        if (options.validate) {
+            ATLC_CHECK_CUDA(cudaMemcpy, actual.data(), a, options.a_size,
+                           cudaMemcpyDeviceToHost);
+            if (actual != (options.copy_back ? peer_original : original))
+                throw std::runtime_error("buffer A validation failed during warm-up");
+        }
         cudaEvent_t start, stop;
         ATLC_CHECK_CUDA(cudaEventCreate, &start);
         ATLC_CHECK_CUDA(cudaEventCreate, &stop);
@@ -195,7 +242,7 @@ int main(int argc, char** argv) {
         for (uint64_t iteration = 0; iteration < options.iterations; ++iteration) {
             ATLC_CHECK_MPI(MPI_Barrier, MPI_COMM_WORLD);
             ATLC_CHECK_CUDA(cudaEventRecord, start, stream);
-            exchange(a, b, options, rank, comm, stream);
+            exchange(a, b, options, rank, comm, stream, pipeline);
             ATLC_CHECK_CUDA(cudaEventRecord, stop, stream);
             ATLC_CHECK_CUDA(cudaEventSynchronize, stop);
             float elapsed_ms, max_ms = 0;
@@ -205,7 +252,8 @@ int main(int argc, char** argv) {
             if (options.validate) {
                 ATLC_CHECK_CUDA(cudaMemcpy, actual.data(), a, options.a_size,
                                cudaMemcpyDeviceToHost);
-                const auto& expected = options.copy_back && iteration % 2 == 0
+                // Warm-up has already performed the first swap.
+                const auto& expected = options.copy_back && iteration % 2 == 1
                                        ? peer_original : original;
                 if (actual != expected)
                     throw std::runtime_error("buffer A validation failed at iteration " +
@@ -221,12 +269,19 @@ int main(int argc, char** argv) {
             }
         }
         if (options.validate)
-            std::fprintf(stderr, "rank %d: byte-for-byte validation passed\n", rank);
+            std::fprintf(stderr, "rank %d: warm-up and all timed swaps validated\n", rank);
         ATLC_CHECK_CUDA(cudaEventDestroy, stop);
         ATLC_CHECK_CUDA(cudaEventDestroy, start);
         ATLC_CHECK_NCCL(ncclCommDestroy, comm);
         ATLC_CHECK_CUDA(cudaFree, b);
         ATLC_CHECK_CUDA(cudaFree, a);
+        if (pipelined) {
+            for (unsigned slot = 0; slot < 2; ++slot) {
+                ATLC_CHECK_CUDA(cudaEventDestroy, pipeline.copy_done[slot]);
+                ATLC_CHECK_CUDA(cudaEventDestroy, pipeline.transfer_done[slot]);
+            }
+            ATLC_CHECK_CUDA(cudaStreamDestroy, pipeline.copy_stream);
+        }
         ATLC_CHECK_CUDA(cudaStreamDestroy, stream);
         ATLC_CHECK_MPI(MPI_Finalize);
         mpi_active = false;
