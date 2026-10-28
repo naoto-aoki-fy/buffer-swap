@@ -66,7 +66,8 @@ int main() {
                             assert(l.rounds == (bytes - 1) / stride + 1);
                             assert(l.heap_required == (method == 1 ? bytes : 0) + stride + l.signal_bytes + (1ULL << 20));
                             assert(l.private_bytes == (method == 1 ? 0 : bytes));
-                            assert(l.signal_generations == l.rounds * (method == 1 ? 1 : 2));
+                            assert(l.signal_bytes == l.grid_blocks * sizeof(uint64_t) * (method == 1 ? 1 : 2));
+                            assert(l.signal_generations == l.rounds);
                             // Independent ownership check: each byte belongs to exactly
                             // one round/block, with a bounded block-local B address.
                             for (uint64_t byte = 0; byte < bytes; ++byte) {
@@ -120,14 +121,17 @@ int main() {
         o = defaults; o.method = method;
         const auto registered = layout(o);
         assert(registered.b_bytes == d.b_bytes && registered.rounds == d.rounds);
-        assert(registered.heap_required + o.a_size == d.heap_required);
+        assert(registered.signal_bytes == 2 * d.signal_bytes);
+        assert(registered.heap_required + o.a_size == d.heap_required + d.signal_bytes);
         const uint64_t heap = registered.heap_required;
         const uint64_t total = heap + o.a_size;
         nvshmem_swap::check_capacity(registered, heap, total);
         rejects([&] { nvshmem_swap::check_capacity(registered, heap - 1, total); });
         rejects([&] { nvshmem_swap::check_capacity(registered, heap, total - 1); });
         rejects([&] { nvshmem_swap::check_capacity(registered, UINT64_MAX, UINT64_MAX); });
-        // Two notifications per round exhaust the counter sooner than method 1.
+        // Separate phase counters each reserve one value per round and swap.
+        o.iterations = UINT64_MAX / registered.signal_generations - 1;
+        assert(layout(o).signal_generations == registered.rounds);
         o.iterations = UINT64_MAX / registered.signal_generations;
         rejects([&] { layout(o); });
         o = defaults; o.method = method; o.chunk_size = 8; o.a_size = UINT64_MAX / 2;

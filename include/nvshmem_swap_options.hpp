@@ -79,9 +79,10 @@ inline Layout layout(const Options& o, uint64_t sms, uint64_t max_threads,
         throw std::invalid_argument("grid blocks exceed hardware limits");
     l.chunk_bytes = o.chunk_size;
     l.b_bytes = multiply(l.chunk_bytes, l.grid_blocks);
-    l.signal_bytes = multiply(l.grid_blocks, sizeof(uint64_t));
+    // Method 1 has one consumed counter; methods 2/3 also have a ready counter.
+    l.signal_bytes = multiply(multiply(l.grid_blocks, o.method == 1 ? 1 : 2), sizeof(uint64_t));
     l.rounds = o.a_size / l.b_bytes + (o.a_size % l.b_bytes != 0);
-    l.signal_generations = multiply(l.rounds, o.method == 1 ? 1 : 2);
+    l.signal_generations = l.rounds;
     // Reserve a distinct signal generation for warm-up and every timed swap.
     multiply(add(o.iterations, 1), l.signal_generations);
     // Conservative room for allocator alignment/runtime symmetric allocations.

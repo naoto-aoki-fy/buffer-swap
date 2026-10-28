@@ -56,11 +56,11 @@ __device__ void copy_chunk(unsigned char* destination_bytes,
         destination_bytes[tail + i] = source_bytes[tail + i];
 }
 
-__device__ void exchange_signal(uint64_t* signal, uint64_t value, int peer) {
-    // Complete the block's work before thread 0 publishes its notification.
+__device__ void notify_and_wait(uint64_t* signal, uint64_t value, int peer) {
+    // Call only after blocking GET completion or local work. No payload
+    // completion is required before publishing this notification.
     __syncthreads();
     if (threadIdx.x == 0) {
-        nvshmem_quiet();
         nvshmemx_signal_op(signal, value, NVSHMEM_SIGNAL_SET, peer);
         // Drain this SET so an old notification cannot replace a newer one.
         nvshmem_quiet();
@@ -75,37 +75,46 @@ __global__ void swap_buffer(unsigned char* a, unsigned char* b, uint64_t* signal
                             uint64_t generation, int peer) {
     const uint64_t stride = uint64_t(gridDim.x) * chunk_bytes;
     unsigned char* staging = b + uint64_t(blockIdx.x) * chunk_bytes;
-    uint64_t* signal = signals + blockIdx.x;
-    constexpr uint64_t phases = Method == 1 ? 1 : 2;
+    uint64_t* ready_signal = signals + blockIdx.x;
+    // Method 1 needs only a consumed counter. Methods 2/3 keep the ready and
+    // consumed phases separate so a later ready cannot satisfy a consumed wait.
+    uint64_t* consumed_signal = signals + blockIdx.x + (Method == 1 ? 0 : gridDim.x);
     uint64_t round = 0;
     for (uint64_t offset = uint64_t(blockIdx.x) * chunk_bytes; offset < a_bytes; ++round) {
         const uint64_t remaining = a_bytes - offset;
         const uint64_t bytes = remaining < chunk_bytes ? remaining : chunk_bytes;
-        const uint64_t ready = generation + phases * round + 1;
+        const uint64_t value = generation + round + 1;
         // Every thread participates in block RMA calls with identical arguments,
         // including when the final chunk is smaller than one typed element.
         if constexpr (Method == 3) {
             copy_chunk<T>(staging, a + offset, bytes);
             // Publish every thread's stores to the NIC before the ready signal.
             __threadfence_system();
-            exchange_signal(signal, ready, peer);
+            notify_and_wait(ready_signal, value, peer);
             nvshmemx_getmem_block(a + offset, staging, bytes, peer);
             // The peer must finish reading B before we stage the next chunk.
-            exchange_signal(signal, ready + 1, peer);
-        } else {
-            if constexpr (Method == 1)
-                nvshmemx_getmem_block(staging, a + offset, bytes, peer);
-            else
-                nvshmemx_putmem_block(staging, a + offset, bytes, peer);
-            // GET: peer has finished reading A. PUT: peer has filled local B.
-            exchange_signal(signal, ready, peer);
+            notify_and_wait(consumed_signal, value, peer);
+        } else if constexpr (Method == 2) {
+            // Blocking put-with-signal consumes local A before returning;
+            // receiving the peer's ready signal establishes delivery into B.
+            nvshmemx_putmem_signal_block(staging, a + offset, bytes,
+                                         ready_signal, value, NVSHMEM_SIGNAL_SET, peer);
+            __syncthreads();
+            if (threadIdx.x == 0)
+                nvshmem_signal_wait_until(ready_signal, NVSHMEM_CMP_GE, value);
+            __syncthreads();
             copy_chunk<T>(a + offset, staging, bytes);
-            if constexpr (Method == 2) {
-                // Do not PUT the next chunk until the peer has consumed its B.
-                exchange_signal(signal, ready + 1, peer);
-            } else {
-                __syncthreads(); // Finish copying before reusing local B.
-            }
+            // The peer acknowledges only after observing our ready and copying
+            // B. Thus our ready SET is delivered before we can issue another,
+            // including across swaps, without a separate quiet in the ready phase.
+            notify_and_wait(consumed_signal, value, peer);
+        } else {
+            nvshmemx_getmem_block(staging, a + offset, bytes, peer);
+            // Blocking GET has completed; the peer must also finish reading A
+            // before we overwrite it. Only the notification needs draining.
+            notify_and_wait(consumed_signal, value, peer);
+            copy_chunk<T>(a + offset, staging, bytes);
+            __syncthreads(); // Finish copying before reusing local B.
         }
         if (stride >= remaining) break; // Avoid overflowing a 64-bit offset.
         offset += stride;

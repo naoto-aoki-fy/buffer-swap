@@ -528,9 +528,11 @@ NVSHMEM collective-launch capacity. An unsupported multiplier fails instead
 of oversubscribing waiting blocks; reduce it or the block size.
 
 B is always allocated with `nvshmem_malloc` and is exactly
-`chunk_size * grid_blocks` bytes. One symmetric 64-bit signal is allocated
-per block. Method 1 also allocates A with `nvshmem_malloc`. Methods 2 and 3
-allocate A with `cudaMalloc`, register it with `nvshmemx_buffer_register`,
+`chunk_size * grid_blocks` bytes. Method 1 allocates one symmetric 64-bit
+consumed counter per block; methods 2 and 3 allocate separate ready and consumed
+counters (16 bytes per block). Method 1 also allocates A with `nvshmem_malloc`.
+Methods 2 and 3 allocate A with `cudaMalloc`, register it with
+`nvshmemx_buffer_register`,
 and unregister it before `cudaFree` during cleanup. Registered A is only a
 local RMA operand; B is the symmetric remote operand. See NVIDIA's
 [memory registration contract](https://docs.nvidia.com/nvshmem/api/latest/gen/api/memory.html#nvshmemx-buffer-register).
@@ -570,9 +572,10 @@ Method 1 preserves the original algorithm. Block `b` owns B at
 `(r * grid_blocks + b) * chunk_bytes` for successive rounds `r`, inside one
 kernel invocation. Chunks never overlap; blocking `nvshmemx_getmem_block`
 fetches only the remaining bytes of a partial final chunk, with every thread
-participating. After a block barrier, thread 0 completes outstanding operations,
-signals the peer's corresponding block with a generation counter, drains the
-signal, and waits for the peer's counter to reach that generation. Only then
+participating. The blocking GET already completes the read. After a block
+barrier, thread 0 signals the peer's consumed counter, drains that SET with
+`nvshmem_quiet()`, and waits for the peer's consumed counter to reach the same
+generation. No quiet is needed before the notification. Only then
 do all threads copy B back into A. For element type `T`, thread `t` copies
 `T` elements at indices `t`, `t + block_size`, `t + 2 * block_size`, and so on.
 Each pass reads and writes consecutive elements across adjacent threads for
@@ -581,16 +584,24 @@ adjacent threads handling consecutive bytes. A block barrier completes all
 passes and the tail before reusing B. The GET and peer handshake happen once
 per chunk, rather than once per copy pass.
 
-Method 2 uses blocking `nvshmemx_putmem_block` to send local A's chunk to
-peer B. The first handshake completes the PUT and waits for the peer's PUT
-into local B before the coalesced local B-to-A copy. A second handshake
-confirms both ranks have consumed B before either sends the next chunk.
+Method 2 uses blocking `nvshmemx_putmem_signal_block` to send local A's chunk
+to peer B and update the peer's ready counter. The call returns after local
+source consumption, so A can be overwritten once the peer's ready notification
+establishes delivery into local B. After the coalesced B-to-A copy, a consumed
+handshake confirms both ranks have finished reading B before either sends the
+next chunk. This acknowledgement also proves delivery of the earlier ready SET
+before the next ready SET can be issued, so the ready phase needs no separate
+quiet. The consumed SET is still drained with quiet before waiting.
+See the [put-with-signal completion contract](https://docs.nvidia.com/nvshmem/api/latest/gen/api/signal.html).
 
 Method 3 first copies local A's chunk into local B with the same coalesced
 copy loop. Every thread issues a system fence before the first handshake
 publishes that B is ready. Blocking `nvshmemx_getmem_block` then copies peer
-B directly into local A. A second handshake confirms both GETs have completed
-before either rank overwrites its small B with the next chunk.
+B directly into local A. A consumed handshake confirms both GETs have completed
+before either rank overwrites its small B with the next chunk. Each handshake
+drains its SET with one quiet; neither needs a pre-notification quiet because
+the ready phase uses system-fenced local stores and the consumed phase follows
+a completed blocking GET.
 
 Select a method on both ranks, for example:
 
@@ -612,9 +623,14 @@ NVSHMEM_SYMMETRIC_SIZE=33G mpirun -np 2 ./bin/nvshmem_swap_bench \
 ```
 
 Counters use a distinct range for each swap, including warm-up, and are never
-reset between iterations. Method 1 uses one counter value per round; methods
-2 and 3 use two, with overflow checks covering warm-up and all timed swaps.
-Signal completion prevents an older SET arriving after a newer SET. In method 1,
+reset between iterations. Each counter uses one value per round, with overflow
+checks covering warm-up and all timed swaps. Ready and consumed counters have
+disjoint storage, so notifications from different phases cannot satisfy each
+other's waits. SET completion (or method 2's consumed acknowledgement for ready)
+prevents an older SET arriving after a newer SET, including at swap boundaries.
+Explicit quiet calls per chunk are reduced from 2 to 1 for method 1, from 4 to 1
+for method 2, and from 4 to 2 for method 3. These are source-level counts, not
+measured speedups or counts of operations internal to NVSHMEM. In method 1,
 the peer notification proves its original-data GET is complete before A is
 overwritten. Blocks advance independently through disjoint
 chunks. System fences publish the local A writes before kernel completion and
@@ -783,7 +799,25 @@ swaps for all widths, several block sizes, independent chunk sizes, multiple
 copy passes, partial
 passes, sub-element tails (including one-thread blocks), exact chunks, many
 rounds, CSV schema and row count, invalid options, oversized allocation and
-launch requests.
+launch requests. It also runs 128 timed swaps per stress case with at least 17
+rounds per block, both exact final rounds and one-byte tails. Use
+`--stress-iterations N` to extend those runs or `--stress-only` to run just the
+reuse tests and grid probes.
+
+Build the test-only skew executable to delay communication differently across
+ranks, blocks and phases while exercising the production kernel:
+
+```bash
+make bin/nvshmem_swap_skew_test
+NVSHMEM_SYMMETRIC_SIZE=64M python3 tests/nvshmem_swap_runtime_test.py \
+    ./bin/nvshmem_swap_skew_test --stress-only \
+    --launcher 'mpirun -np 2 --map-by ppr:2:node'
+```
+
+The skew executable's timings are unsuitable for performance comparisons. Run
+both ordinary and skew tests on local P2P and the intended remote transport;
+adjust the launcher for two-node placement as above. Host tests do not validate
+GPU memory visibility, transport progress or notification ordering.
 Also verify one/three ranks, duplicate GPU assignments, unavailable local P2P,
 differing rank options/SM counts, unavailable HCAs in two-node mode, and a heap
 exceeding available GPU memory fail with diagnostics. These cluster checks, real CUDA device linking, event timing,
