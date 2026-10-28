@@ -476,11 +476,12 @@ See NVIDIA's [NVSHMEM compilation and MPI interoperability guide](https://docs.n
 | Option | Meaning | Default |
 |---|---|---|
 | `-a`, `--a-size SIZE` | A bytes per GPU | `32G` (32 GiB) |
-| `-c`, `--chunk-size SIZE` | Download bytes per block, independent of thread count | `256K` (256 KiB) |
+| `-c`, `--chunk-size SIZE` | Transfer bytes per block, independent of thread count | `256K` (256 KiB) |
 | `-e`, `--element-bytes N` | Typed copy width per thread per pass; 1, 2, 4 or 8 | `8` |
 | `-t`, `--block-size N` | CUDA threads per block | `256` |
 | `-m`, `--sm-multiplier N` | Multiplier of the GPU SM count | `1` |
 | `-n`, `--iterations N` | Timed complete swaps | `128` |
+| `--method N` | 1: symmetric GET, 2: registered PUT, 3: staged GET | `1` |
 | `--validate` | Verify warm-up and every timed swap, both ranks | Disabled |
 | `-h`, `--help` | Usage on stderr, without CUDA/NVSHMEM initialization | |
 
@@ -488,7 +489,7 @@ Positive decimal sizes use the existing binary K/M/G suffix convention.
 Arbitrary byte sizes are accepted, including a tail smaller than one element.
 The chunk size is independent of element size and block size, and must be a
 positive multiple of the element size so all typed copies are aligned.
-Neither A nor the final downloaded chunk must be divisible by the element
+Neither A nor the final transferred chunk must be divisible by the element
 size. Signs, zero, fractions, overflow, unsupported widths, unaligned chunk
 sizes and positional arguments fail. Validation limits A to 16 MiB.
 
@@ -498,20 +499,27 @@ and round counts. The executable checks CUDA block/grid limits and each GPU's
 NVSHMEM collective-launch capacity. An unsupported multiplier fails instead
 of oversubscribing waiting blocks; reduce it or the block size.
 
-A and B are symmetric GPU allocations, with B exactly
-`chunk_size * grid_blocks` bytes. One symmetric 64-bit signal
-is allocated per block. B is symmetric so that the IBRC GET destination is
-registered GPU memory; no separate registration or host staging is needed.
-A uses different cuRAND seeds on the two ranks, with a cuRAND device kernel
-initializing any trailing bytes outside whole 32-bit words.
+B is always allocated with `nvshmem_malloc` and is exactly
+`chunk_size * grid_blocks` bytes. One symmetric 64-bit signal is allocated
+per block. Method 1 also allocates A with `nvshmem_malloc`. Methods 2 and 3
+allocate A with `cudaMalloc`, register it with `nvshmemx_buffer_register`,
+and unregister it before `cudaFree` during cleanup. Registered A is only a
+local RMA operand; B is the symmetric remote operand. See NVIDIA's
+[memory registration contract](https://docs.nvidia.com/nvshmem/api/latest/gen/api/memory.html#nvshmemx-buffer-register).
+No method stages payloads in host memory. A uses different cuRAND seeds on
+the two ranks, with a cuRAND device kernel initializing any trailing bytes
+outside whole 32-bit words.
 
-This implementation forces `NVSHMEM_DISABLE_CUDA_VMM=1` and uses a static
-CUDA-backed symmetric heap. Before NVSHMEM initialization, it checks that
-`NVSHMEM_SYMMETRIC_SIZE` holds A+B+signals plus a conservative 1 MiB reserve
-and fits in free GPU memory. Allocation failure remains fatal because runtime
-resources and alignment can require more space. The accepted heap setting
-uses the same integer K/M/G notation and is normalized to bytes; if unset,
-1 GiB is assumed. Set it explicitly for production runs:
+Before NVSHMEM initialization, the benchmark checks that
+`NVSHMEM_SYMMETRIC_SIZE` holds the symmetric allocations plus a conservative
+1 MiB reserve: A+B+signals for method 1, B+signals for methods 2 and 3.
+The free-memory check accounts for the configured heap plus the separate
+A allocation in methods 2 and 3. Allocation failure remains fatal because
+runtime resources and alignment can require more space. The capacity check
+assumes the configured heap is fully allocated; the benchmark preserves
+inherited NVSHMEM environment settings, including the VMM setting. The heap
+setting uses integer K/M/G notation; if unset, 1 GiB is assumed.
+For method 1 with the default A, set it explicitly:
 
 ```bash
 export NVSHMEM_SYMMETRIC_SIZE=33G
@@ -520,12 +528,17 @@ export NVSHMEM_SYMMETRIC_SIZE=33G
 For the default A, this provides room beyond 32 GiB for B, signals and runtime
 allocations. Each GPU needs free memory for the **entire configured heap**,
 plus CUDA, cuRAND and NVSHMEM overhead; a 32 GiB GPU cannot run the default.
+Methods 2 and 3 additionally need space for their separately allocated A.
+For example, with 112 blocks and 256 KiB chunks, their 28 MiB B fits in a
+64 MiB heap even with the default 32 GiB A; the GPU still needs more than
+32 GiB free in total.
 Larger block counts can require a larger heap. Excessive sizes and signal
 counter overflow are rejected before launching the swap kernel.
 
 ### Algorithm and synchronization
 
-Block `b` owns B at `b * chunk_bytes` and processes A at
+Method 1 preserves the original algorithm. Block `b` owns B at
+`b * chunk_bytes` and processes A at
 `(r * grid_blocks + b) * chunk_bytes` for successive rounds `r`, inside one
 kernel invocation. Chunks never overlap; blocking `nvshmemx_getmem_block`
 fetches only the remaining bytes of a partial final chunk, with every thread
@@ -540,6 +553,26 @@ adjacent threads handling consecutive bytes. A block barrier completes all
 passes and the tail before reusing B. The GET and peer handshake happen once
 per chunk, rather than once per copy pass.
 
+Method 2 uses blocking `nvshmemx_putmem_block` to send local A's chunk to
+peer B. The first handshake completes the PUT and waits for the peer's PUT
+into local B before the coalesced local B-to-A copy. A second handshake
+confirms both ranks have consumed B before either sends the next chunk.
+
+Method 3 first copies local A's chunk into local B with the same coalesced
+copy loop. Every thread issues a system fence before the first handshake
+publishes that B is ready. Blocking `nvshmemx_getmem_block` then copies peer
+B directly into local A. A second handshake confirms both GETs have completed
+before either rank overwrites its small B with the next chunk.
+
+Select a method on both ranks, for example:
+
+```bash
+NVSHMEM_SYMMETRIC_SIZE=64M mpirun -np 2 ./bin/nvshmem_swap_bench \
+    --method 2 -a 1M -c 256K -n 3 --validate
+NVSHMEM_SYMMETRIC_SIZE=64M mpirun -np 2 ./bin/nvshmem_swap_bench \
+    --method 3 -a 1M -c 256K -n 3 --validate
+```
+
 For example, `-c 256K -e 8 -t 256` downloads 256 KiB per block and copies
 128 passes of 256 eight-byte elements for a full chunk. With 112 blocks, B
 uses 28 MiB. Set `-c 2K` with `-e 8 -t 256` to reproduce the previous chunk
@@ -551,9 +584,11 @@ NVSHMEM_SYMMETRIC_SIZE=33G mpirun -np 2 ./bin/nvshmem_swap_bench \
 ```
 
 Counters use a distinct range for each swap, including warm-up, and are never
-reset between iterations. Signal completion prevents an older SET arriving
-after a newer SET. The peer notification proves its original-data GET is
-complete before A is overwritten. Blocks advance independently through disjoint
+reset between iterations. Method 1 uses one counter value per round; methods
+2 and 3 use two, with overflow checks covering warm-up and all timed swaps.
+Signal completion prevents an older SET arriving after a newer SET. In method 1,
+the peer notification proves its original-data GET is complete before A is
+overwritten. Blocks advance independently through disjoint
 chunks. System fences publish the local A writes before kernel completion and
 the next iteration's MPI barrier. Kernels use `nvshmemx_collective_launch`;
 the queried maximum grid prevents waiting blocks from blocking unlaunched peers.
@@ -585,8 +620,9 @@ without requiring an InfiniBand adapter. MNNVL and NCCL collectives remain disab
 it unset or set it to `0` to run without an IB adapter. Enabling it requires
 the IBGDA runtime prerequisites even though local payloads use P2P. The static
 symmetric heap and GPU swap kernel are the same as in two-node mode. After allocating the symmetric buffers, each rank
-checks `nvshmem_ptr` for peer access to A, B and the signals before launching
-any swap. Unsupported P2P fails; there is no network fallback in local mode.
+checks `nvshmem_ptr` for peer access to B and the signals, and also A in
+method 1, before launching any swap. Unsupported P2P fails; there is no network
+fallback in local mode.
 See NVIDIA's [environment settings](https://docs.nvidia.com/nvshmem/api/latest/gen/env.html)
 and [P2P-access query documentation](https://docs.nvidia.com/nvshmem/api/latest/faq.html).
 
@@ -664,9 +700,10 @@ One untimed warm-up swaps A before measurement. Each timed iteration uses an
 MPI barrier, CUDA start event, exactly one complete swap kernel, CUDA stop
 event, stop-event synchronization and `cudaEventElapsedTime` on the same
 stream. MPI reduces the two times with MAX. Allocation, initialization,
-validation and cleanup are excluded; the timed interval includes every GET,
-signal/wait and B-to-A copy. Collective launch is called between the events,
-so host launch/setup gaps can contribute to the event interval.
+validation and cleanup are excluded; the timed interval includes every GET
+or PUT, signal/wait and local chunk copy for the selected method. Collective
+launch is called between the events, so host launch/setup gaps can contribute
+to the event interval.
 
 Rank 0 alone emits one header and the requested number of rows:
 
@@ -675,7 +712,9 @@ iteration,buffer_a_bytes,buffer_b_bytes,element_bytes,block_size,sm_multiplier,g
 0,34359738368,29360128,8,256,1,112,262144,1234.567
 ```
 
-Values are illustrative. `--validate` takes original host snapshots before
+Values are illustrative. The CSV schema is the same for all three methods;
+the selected method is reported in each rank's stderr configuration line.
+`--validate` takes original host snapshots before
 warm-up, exchanges references with MPI outside timing, then compares every
 byte on both GPUs after warm-up and every timed swap. Timed iteration 0
 restores each GPU's original data; iteration 1 contains its peer's original.
@@ -688,11 +727,11 @@ g++ -std=c++17 -Wall -Wextra -Werror -Iinclude tests/nvshmem_swap_options_test.c
 /tmp/nvshmem_swap_options_test
 ```
 
-These cover defaults/options, independent chunk sizing, all widths, various
-blocks/multipliers, tiny, exact and partial chunks/rounds, 64-bit overflow,
-hardware limits, signal
-counter exhaustion, heap capacity and free-memory rejection. On the allocated
-two-node GPU/IB cluster, build the program, verify transport, then run:
+These cover all three methods, defaults/options, independent chunk sizing,
+all widths, various blocks/multipliers, tiny, exact and partial chunks/rounds,
+64-bit overflow, hardware limits, signal counter exhaustion, heap capacity
+and free-memory rejection including private A. On the allocated two-node
+GPU/IB cluster, build the program, verify transport, then run:
 
 ```bash
 NVSHMEM_SYMMETRIC_SIZE=64M python3 tests/nvshmem_swap_runtime_test.py \
@@ -711,8 +750,9 @@ CUDA_VISIBLE_DEVICES=0,1 NVSHMEM_SYMMETRIC_SIZE=64M \
     --launcher 'mpirun -np 2 --map-by ppr:2:node'
 ```
 
-The runner checks both ranks' validation of repeated swaps for all widths,
-several block sizes, independent chunk sizes, multiple copy passes, partial
+The runner checks all three methods and both ranks' validation of repeated
+swaps for all widths, several block sizes, independent chunk sizes, multiple
+copy passes, partial
 passes, sub-element tails (including one-thread blocks), exact chunks, many
 rounds, CSV schema and row count, invalid options, oversized allocation and
 launch requests.

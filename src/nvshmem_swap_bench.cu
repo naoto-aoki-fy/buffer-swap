@@ -22,15 +22,17 @@ static void usage() {
     std::fprintf(stderr,
         "Usage: nvshmem_swap_bench [options] (exactly two ranks, one GPU per rank)\n"
         "  -a, --a-size SIZE       A bytes per GPU (default 32G)\n"
-        "  -c, --chunk-size SIZE   Download bytes per block (default 256K; multiple of -e)\n"
+        "  -c, --chunk-size SIZE   Transfer bytes per block (default 256K; multiple of -e)\n"
         "  -e, --element-bytes N   1, 2, 4 or 8 (default 8)\n"
         "  -t, --block-size N      Threads per block (default 256)\n"
         "  -m, --sm-multiplier N   Blocks per SM (default 1)\n"
         "  -n, --iterations N      Timed full swaps (default 128)\n"
+        "      --method N          1: symmetric GET (default), 2: registered PUT, 3: staged GET\n"
         "      --validate          Verify warm-up and every swap; A <= 16M\n"
         "  -h, --help              Show help on stderr\n"
         "SIZE: positive integer with binary K/M/G suffix. Set NVSHMEM_SYMMETRIC_SIZE\n"
-        "large enough for A+B+signals+1 MiB; default A needs e.g. 33G.\n");
+        "large enough for symmetric buffers+1 MiB: A+B+signals for method 1\n"
+        "(default A needs e.g. 33G), B+signals for methods 2/3 (A is separate).\n");
 }
 
 __global__ void random_tail(unsigned char* tail, size_t bytes, unsigned long long seed) {
@@ -41,48 +43,85 @@ __global__ void random_tail(unsigned char* tail, size_t bytes, unsigned long lon
 }
 
 template <typename T>
+__device__ void copy_chunk(unsigned char* destination_bytes,
+                           const unsigned char* source_bytes, uint64_t bytes) {
+    // Adjacent threads copy adjacent elements, including across multiple passes.
+    auto* destination = reinterpret_cast<T*>(destination_bytes);
+    const auto* source = reinterpret_cast<const T*>(source_bytes);
+    const uint64_t elements = bytes / sizeof(T);
+    for (uint64_t i = threadIdx.x; i < elements; i += blockDim.x)
+        destination[i] = source[i];
+    const uint64_t tail = elements * sizeof(T);
+    for (uint64_t i = threadIdx.x; i < bytes - tail; i += blockDim.x)
+        destination_bytes[tail + i] = source_bytes[tail + i];
+}
+
+__device__ void exchange_signal(uint64_t* signal, uint64_t value, int peer) {
+    // Complete the block's work before thread 0 publishes its notification.
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        nvshmem_quiet();
+        nvshmemx_signal_op(signal, value, NVSHMEM_SIGNAL_SET, peer);
+        // Drain this SET so an old notification cannot replace a newer one.
+        nvshmem_quiet();
+        nvshmem_signal_wait_until(signal, NVSHMEM_CMP_GE, value);
+    }
+    __syncthreads();
+}
+
+template <typename T, int Method>
 __global__ void swap_buffer(unsigned char* a, unsigned char* b, uint64_t* signals,
                             uint64_t a_bytes, uint64_t chunk_bytes,
                             uint64_t generation, int peer) {
     const uint64_t stride = uint64_t(gridDim.x) * chunk_bytes;
     unsigned char* staging = b + uint64_t(blockIdx.x) * chunk_bytes;
+    uint64_t* signal = signals + blockIdx.x;
+    constexpr uint64_t phases = Method == 1 ? 1 : 2;
     uint64_t round = 0;
     for (uint64_t offset = uint64_t(blockIdx.x) * chunk_bytes; offset < a_bytes; ++round) {
         const uint64_t remaining = a_bytes - offset;
         const uint64_t bytes = remaining < chunk_bytes ? remaining : chunk_bytes;
-        // Blocking block GET completes into local B. Every thread calls it
-        // with identical arguments, even for a sub-element final chunk.
-        nvshmemx_getmem_block(staging, a + offset, bytes, peer);
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            nvshmem_quiet();
-            nvshmemx_signal_op(signals + blockIdx.x, generation + round + 1,
-                               NVSHMEM_SIGNAL_SET, peer);
-            // Drain this SET before another generation can be issued: no
-            // delayed old SET can replace a newer notification.
-            nvshmem_quiet();
-            nvshmem_signal_wait_until(signals + blockIdx.x, NVSHMEM_CMP_GE,
-                                      generation + round + 1);
+        const uint64_t ready = generation + phases * round + 1;
+        // Every thread participates in block RMA calls with identical arguments,
+        // including when the final chunk is smaller than one typed element.
+        if constexpr (Method == 3) {
+            copy_chunk<T>(staging, a + offset, bytes);
+            // Publish every thread's stores to the NIC before the ready signal.
+            __threadfence_system();
+            exchange_signal(signal, ready, peer);
+            nvshmemx_getmem_block(a + offset, staging, bytes, peer);
+            // The peer must finish reading B before we stage the next chunk.
+            exchange_signal(signal, ready + 1, peer);
+        } else {
+            if constexpr (Method == 1)
+                nvshmemx_getmem_block(staging, a + offset, bytes, peer);
+            else
+                nvshmemx_putmem_block(staging, a + offset, bytes, peer);
+            // GET: peer has finished reading A. PUT: peer has filled local B.
+            exchange_signal(signal, ready, peer);
+            copy_chunk<T>(a + offset, staging, bytes);
+            if constexpr (Method == 2) {
+                // Do not PUT the next chunk until the peer has consumed its B.
+                exchange_signal(signal, ready + 1, peer);
+            } else {
+                __syncthreads(); // Finish copying before reusing local B.
+            }
         }
-        __syncthreads();
-        // Chunk boundaries are aligned to T. Adjacent threads copy adjacent
-        // elements on each pass, advancing by one block of elements per pass.
-        auto* destination = reinterpret_cast<T*>(a + offset);
-        const auto* source = reinterpret_cast<const T*>(staging);
-        const uint64_t elements = bytes / sizeof(T);
-        for (uint64_t i = threadIdx.x; i < elements; i += blockDim.x)
-            destination[i] = source[i];
-        // The last chunk of A may end with fewer than sizeof(T) bytes.
-        const uint64_t tail = elements * sizeof(T);
-        for (uint64_t i = threadIdx.x; i < bytes - tail; i += blockDim.x)
-            a[offset + tail + i] = staging[tail + i];
-        __syncthreads(); // Complete the copy before reusing this block's B.
         if (stride >= remaining) break; // Avoid overflowing a 64-bit offset.
         offset += stride;
     }
-    // Publish every thread's local A stores to the NIC before kernel completion
-    // and the host MPI barrier allow the next iteration's remote GETs.
+    // Publish local A stores before kernel completion and the next swap.
     __threadfence_system();
+}
+
+template <typename T>
+static const void* select_kernel(uint64_t method) {
+    switch (method) {
+        case 1: return reinterpret_cast<const void*>(swap_buffer<T, 1>);
+        case 2: return reinterpret_cast<const void*>(swap_buffer<T, 2>);
+        case 3: return reinterpret_cast<const void*>(swap_buffer<T, 3>);
+        default: throw std::invalid_argument("method must be 1, 2 or 3");
+    }
 }
 
 static void matching(const uint64_t* values, int count) {
@@ -105,8 +144,8 @@ int main(int argc, char** argv) {
         ATLC_CHECK_MPI(MPI_Comm_rank, MPI_COMM_WORLD, &rank);
         const auto o = nvshmem_swap::parse_options(argc, argv);
         const uint64_t config[] = {o.a_size, o.chunk_size, o.element_bytes, o.block_size, o.sm_multiplier,
-                                   o.iterations, uint64_t(o.validate), uint64_t(o.help)};
-        matching(config, 8);
+                                   o.iterations, uint64_t(o.validate), uint64_t(o.help), o.method};
+        matching(config, 9);
         if (o.help) {
             if (!rank) usage();
             ATLC_CHECK_MPI(MPI_Finalize);
@@ -175,14 +214,20 @@ int main(int argc, char** argv) {
         check_nvshmem(nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr), "nvshmemx_init_attr");
         if (nvshmem_n_pes() != 2 || nvshmem_my_pe() != rank)
             throw std::runtime_error("NVSHMEM PE mapping differs from MPI ranks");
-        auto* a = static_cast<unsigned char*>(nvshmem_malloc(o.a_size));
+        unsigned char* a = nullptr;
+        if (o.method == 1) {
+            a = static_cast<unsigned char*>(nvshmem_malloc(o.a_size));
+        } else {
+            ATLC_CHECK_CUDA(cudaMalloc, reinterpret_cast<void**>(&a), o.a_size);
+            check_nvshmem(nvshmemx_buffer_register(a, o.a_size), "nvshmemx_buffer_register");
+        }
         auto* b = static_cast<unsigned char*>(nvshmem_malloc(l.b_bytes));
         auto* signals = static_cast<uint64_t*>(nvshmem_malloc(l.signal_bytes));
         if (!a || !b || !signals)
             throw std::runtime_error("NVSHMEM symmetric allocation failed; increase heap capacity/free GPU memory");
         // Fail before launching a waiting kernel if either PE cannot map the
         // peer's symmetric buffers through the selected local P2P transport.
-        if (single_node && (!nvshmem_ptr(a, 1 - rank) ||
+        if (single_node && ((o.method == 1 && !nvshmem_ptr(a, 1 - rank)) ||
                             !nvshmem_ptr(b, 1 - rank) ||
                             !nvshmem_ptr(signals, 1 - rank)))
             throw std::runtime_error("single-node runs require NVSHMEM P2P access between both GPUs");
@@ -196,8 +241,8 @@ int main(int argc, char** argv) {
             l.grid_blocks, o.a_size, l.b_bytes, l.chunk_bytes, heap_bytes,
             single_node ? "single-node" : "two-node", single_node ? "P2P" : "ibrc");
         std::fprintf(stderr, "rank %d element=%" PRIu64 " block=%" PRIu64
-            " multiplier=%" PRIu64 " iterations=%" PRIu64 " validate=%d\n",
-            rank, o.element_bytes, o.block_size, o.sm_multiplier, o.iterations, int(o.validate));
+            " multiplier=%" PRIu64 " iterations=%" PRIu64 " method=%" PRIu64 " validate=%d\n",
+            rank, o.element_bytes, o.block_size, o.sm_multiplier, o.iterations, o.method, int(o.validate));
         const char* ibgda_setting = std::getenv("NVSHMEM_IB_ENABLE_IBGDA");
         std::fprintf(stderr, "rank %d NVSHMEM_IB_ENABLE_IBGDA=%s (verify path in runtime logs)\n",
                      rank, ibgda_setting ? ibgda_setting : "unset (runtime default)");
@@ -222,10 +267,10 @@ int main(int argc, char** argv) {
         void* args[] = {&a, &b, &signals, &a_bytes, &chunk, &generation, &peer};
         const void* kernel = nullptr;
         switch (o.element_bytes) {
-            case 1: kernel = reinterpret_cast<const void*>(swap_buffer<uint8_t>); break;
-            case 2: kernel = reinterpret_cast<const void*>(swap_buffer<uint16_t>); break;
-            case 4: kernel = reinterpret_cast<const void*>(swap_buffer<uint32_t>); break;
-            case 8: kernel = reinterpret_cast<const void*>(swap_buffer<uint64_t>); break;
+            case 1: kernel = select_kernel<uint8_t>(o.method); break;
+            case 2: kernel = select_kernel<uint16_t>(o.method); break;
+            case 4: kernel = select_kernel<uint32_t>(o.method); break;
+            case 8: kernel = select_kernel<uint64_t>(o.method); break;
         }
         int max_blocks = 0;
         check_nvshmem(nvshmemx_collective_launch_query_gridsize(kernel, dim3(o.block_size), args,
@@ -262,7 +307,7 @@ int main(int argc, char** argv) {
         ATLC_CHECK_CUDA(cudaEventCreate, &stop);
         if (!rank) std::printf("iteration,buffer_a_bytes,buffer_b_bytes,element_bytes,block_size,sm_multiplier,grid_blocks,chunk_bytes,elapsed_ms\n");
         for (uint64_t i = 0; i < o.iterations; ++i) {
-            generation = (i + 1) * l.rounds;
+            generation = (i + 1) * l.signal_generations;
             ATLC_CHECK_MPI(MPI_Barrier, MPI_COMM_WORLD);
             ATLC_CHECK_CUDA(cudaEventRecord, start, stream);
             exchange();
@@ -283,7 +328,13 @@ int main(int argc, char** argv) {
         ATLC_CHECK_CUDA(cudaEventDestroy, start);
         ATLC_CHECK_CUDA(cudaStreamDestroy, stream);
         ATLC_CHECK_MPI(MPI_Barrier, MPI_COMM_WORLD);
-        nvshmem_free(signals); nvshmem_free(b); nvshmem_free(a);
+        nvshmem_free(signals); nvshmem_free(b);
+        if (o.method == 1) {
+            nvshmem_free(a);
+        } else {
+            check_nvshmem(nvshmemx_buffer_unregister(a), "nvshmemx_buffer_unregister");
+            ATLC_CHECK_CUDA(cudaFree, a);
+        }
         nvshmem_finalize();
         ATLC_CHECK_MPI(MPI_Finalize);
         mpi_active = false;

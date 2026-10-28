@@ -22,12 +22,13 @@ static nvshmem_swap::Layout layout(const nvshmem_swap::Options& o, uint64_t sms 
 int main() {
     const auto defaults = parse({"bench"});
     assert(defaults.a_size == 34359738368ULL && defaults.element_bytes == 8);
-    assert(defaults.chunk_size == 262144);
+    assert(defaults.chunk_size == 262144 && defaults.method == 1);
     assert(defaults.block_size == 256 && defaults.sm_multiplier == 1 && defaults.iterations == 128);
     assert(!defaults.help && !defaults.validate);
     const auto d = layout(defaults);
     assert(d.grid_blocks == 112 && d.chunk_bytes == 262144 && d.b_bytes == 29360128);
     assert(d.signal_bytes == 896 && d.rounds == 1171);
+    assert(d.signal_generations == d.rounds && d.private_bytes == 0);
     assert(parse({"bench", "-h"}).help && parse({"bench", "--help"}).help);
     const auto custom = parse({"bench", "--a-size=2k", "--chunk-size=32k", "--element-bytes=2", "-t", "32",
                                "--sm-multiplier", "2", "-n", "3", "--validate"});
@@ -47,36 +48,44 @@ int main() {
             assert(layout(o).b_bytes == d.b_bytes);
         }
     }
-    // Arbitrary byte counts, including sub-element tails, are legal.
-    for (uint64_t width : {1, 2, 4, 8}) {
-        for (uint64_t threads : {1, 32, 128, 256}) {
-            for (uint64_t mult : {1, 2, 3}) {
-                for (uint64_t chunk : {width, width * threads, width * (3 * threads + 1)}) {
-                    auto o = defaults;
-                    o.element_bytes = width; o.block_size = threads; o.sm_multiplier = mult;
-                    o.chunk_size = chunk;
-                    const uint64_t stride = chunk * 4 * mult;
-                    for (uint64_t bytes : {uint64_t{1}, chunk, chunk + 1, stride - 1, stride, stride + 3}) {
-                        o.a_size = bytes;
-                        const auto l = layout(o, 4);
-                        assert(l.chunk_bytes == chunk && l.b_bytes == stride);
-                        assert(l.rounds == (bytes - 1) / stride + 1);
-                        assert(l.heap_required == bytes + stride + l.signal_bytes + (1ULL << 20));
-                        // Independent ownership check: each byte belongs to exactly
-                        // one round/block, with a bounded block-local B address.
-                        for (uint64_t byte = 0; byte < bytes; ++byte) {
-                            const auto block = (byte / chunk) % l.grid_blocks;
-                            const auto round = (byte / chunk) / l.grid_blocks;
-                            const auto staging = block * chunk + byte % chunk;
-                            assert(round < l.rounds && staging < l.b_bytes);
+    for (uint64_t method : {1, 2, 3}) {
+        assert(parse({"bench", "--method", std::to_string(method)}).method == method);
+        // Arbitrary byte counts, including sub-element tails, are legal.
+        for (uint64_t width : {1, 2, 4, 8}) {
+            for (uint64_t threads : {1, 32, 128, 256}) {
+                for (uint64_t mult : {1, 2, 3}) {
+                    for (uint64_t chunk : {width, width * threads, width * (3 * threads + 1)}) {
+                        auto o = defaults;
+                        o.element_bytes = width; o.block_size = threads; o.sm_multiplier = mult;
+                        o.chunk_size = chunk; o.method = method;
+                        const uint64_t stride = chunk * 4 * mult;
+                        for (uint64_t bytes : {uint64_t{1}, chunk, chunk + 1, stride - 1, stride, stride + 3}) {
+                            o.a_size = bytes;
+                            const auto l = layout(o, 4);
+                            assert(l.chunk_bytes == chunk && l.b_bytes == stride);
+                            assert(l.rounds == (bytes - 1) / stride + 1);
+                            assert(l.heap_required == (method == 1 ? bytes : 0) + stride + l.signal_bytes + (1ULL << 20));
+                            assert(l.private_bytes == (method == 1 ? 0 : bytes));
+                            assert(l.signal_generations == l.rounds * (method == 1 ? 1 : 2));
+                            // Independent ownership check: each byte belongs to exactly
+                            // one round/block, with a bounded block-local B address.
+                            for (uint64_t byte = 0; byte < bytes; ++byte) {
+                                const auto block = (byte / chunk) % l.grid_blocks;
+                                const auto round = (byte / chunk) / l.grid_blocks;
+                                const auto staging = block * chunk + byte % chunk;
+                                assert(round < l.rounds && staging < l.b_bytes);
+                            }
                         }
+                        assert(parse({"bench", "-a", "3", "-e", std::to_string(width)}).a_size == 3);
                     }
-                    assert(parse({"bench", "-a", "3", "-e", std::to_string(width)}).a_size == 3);
                 }
             }
         }
     }
     for (const auto& args : std::vector<std::vector<std::string>>{
+        {"bench", "--method"}, {"bench", "--method", "0"}, {"bench", "--method", "4"},
+        {"bench", "--method", "-1"}, {"bench", "--method", "1G"},
+        {"bench", "--method", "18446744073709551616"},
         {"bench", "-a"}, {"bench", "-c"}, {"bench", "-m"}, {"bench", "--unknown"}, {"bench", "position"},
         {"bench", "-a", "0"}, {"bench", "-a", "1GB"}, {"bench", "-a", "1.5G"},
         {"bench", "-a", "-1"}, {"bench", "-a", "+1"}, {"bench", "-a", " 1"},
@@ -107,5 +116,24 @@ int main() {
     nvshmem_swap::check_capacity(d, uint64_t{33} << 30, uint64_t{40} << 30);
     rejects([&] { nvshmem_swap::check_capacity(d, uint64_t{32} << 30, uint64_t{40} << 30); });
     rejects([&] { nvshmem_swap::check_capacity(d, uint64_t{33} << 30, uint64_t{32} << 30); });
+    for (uint64_t method : {2, 3}) {
+        o = defaults; o.method = method;
+        const auto registered = layout(o);
+        assert(registered.b_bytes == d.b_bytes && registered.rounds == d.rounds);
+        assert(registered.heap_required + o.a_size == d.heap_required);
+        const uint64_t heap = registered.heap_required;
+        const uint64_t total = heap + o.a_size;
+        nvshmem_swap::check_capacity(registered, heap, total);
+        rejects([&] { nvshmem_swap::check_capacity(registered, heap - 1, total); });
+        rejects([&] { nvshmem_swap::check_capacity(registered, heap, total - 1); });
+        rejects([&] { nvshmem_swap::check_capacity(registered, UINT64_MAX, UINT64_MAX); });
+        // Two notifications per round exhaust the counter sooner than method 1.
+        o.iterations = UINT64_MAX / registered.signal_generations;
+        rejects([&] { layout(o); });
+        o = defaults; o.method = method; o.chunk_size = 8; o.a_size = UINT64_MAX / 2;
+        rejects([&] { layout(o, 1); });
+    }
+    o = defaults; o.method = 0; rejects([&] { layout(o); });
+    o.method = 4; rejects([&] { layout(o); });
     std::cout << "NVSHMEM option, layout, overflow and capacity tests passed\n";
 }

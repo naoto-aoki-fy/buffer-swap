@@ -33,7 +33,8 @@ def main():
 
     help_result = run(['--help'])
     assert not help_result.stdout and 'Usage:' in help_result.stderr
-    for options in [['-a', '0'], ['-c', '0'], ['-c'], ['-c', '3', '-e', '2'], ['-e', '3'],
+    for options in [['--method'], ['--method', '0'], ['--method', '4'],
+                    ['-a', '0'], ['-c', '0'], ['-c'], ['-c', '3', '-e', '2'], ['-e', '3'],
                     ['-t', '0'], ['-m', '0'], ['-n', '0'],
                     ['--unknown'], ['-a'], ['positional'], ['--validate'],
                     ['-a', '18446744073709551615G'], ['-a', '64G'],
@@ -41,10 +42,12 @@ def main():
         run(options, success=False)
     cases = 0
 
-    def validate_case(size, width, threads, multiplier, chunk=None):
+    def validate_case(size, width, threads, multiplier, chunk=None, method=None):
         nonlocal cases
         options = ['-a', str(size), '-e', str(width), '-t', str(threads),
                    '-m', str(multiplier), '-n', '3', '--validate']
+        if method is not None:
+            options += ['--method', str(method)]
         if chunk is not None:
             options += ['--chunk-size', str(chunk)]
         expected_chunk = 262144 if chunk is None else chunk
@@ -66,22 +69,25 @@ def main():
                 assert (f'rank {rank} NVSHMEM_IB_ENABLE_IBGDA='
                         f'{env["NVSHMEM_IB_ENABLE_IBGDA"]} (verify path in runtime logs)'
                         in result.stderr), result.stderr
+        assert result.stderr.count(f'method={method or 1} validate=1') == 2, result.stderr
         cases += 1
 
-    for multiplier in map(int, args.sm_multipliers.split(',')):
-        for width in [1, 2, 4, 8]:
-            for threads in [32, 128, 256]:
-                # Default chunk is independent of element width and block size.
-                for size in [1, 3, 262144, 262145, 1048579]:
-                    validate_case(size, width, threads, multiplier)
-                # Underfilled blocks, one pass, multiple passes with a partial
-                # last pass, and an independent larger chunk. A has a byte tail.
-                for chunk in sorted({width, width * threads,
-                                     width * (3 * threads + 1), 32768}):
-                    size = 1048579 if chunk == width * threads else 3 * chunk + 3
-                    validate_case(size, width, threads, multiplier, chunk)
-            # A tail may need several passes when the block has only one thread.
-            validate_case(32771, width, 1, multiplier, 32768)
+    validate_case(3, 8, 32, 1)  # Omitting --method retains the original path.
+    for method in [1, 2, 3]:
+        for multiplier in map(int, args.sm_multipliers.split(',')):
+            for width in [1, 2, 4, 8]:
+                for threads in [32, 128, 256]:
+                    # Default chunk is independent of element width and block size.
+                    for size in [1, 3, 262144, 262145, 1048579]:
+                        validate_case(size, width, threads, multiplier, method=method)
+                    # Underfilled blocks, one pass, multiple passes with a partial
+                    # last pass, and an independent larger chunk. A has a byte tail.
+                    for chunk in sorted({width, width * threads,
+                                         width * (3 * threads + 1), 32768}):
+                        size = 1048579 if chunk == width * threads else 3 * chunk + 3
+                        validate_case(size, width, threads, multiplier, chunk, method=method)
+                # A tail may need several passes when the block has only one thread.
+                validate_case(32771, width, 1, multiplier, 32768, method=method)
     print(f'{cases} NVSHMEM validation/CSV cases passed')
 
 
