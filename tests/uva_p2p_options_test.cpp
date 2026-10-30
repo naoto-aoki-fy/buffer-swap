@@ -20,6 +20,11 @@ static uva_p2p::Options parse(std::vector<std::string> args) {
 
 int main() {
     const auto defaults = parse({"bench"});
+    assert(!defaults.memcpy_async);
+    const auto copy = parse({"bench", "--memcpy-async", "--grid-stride"});
+    assert(copy.memcpy_async);
+    assert(uva_p2p::grid_size(copy, 0, 0, 0, 0) == 0);
+    rejects([&] { parse({"bench", "--memcpy-async=1"}); });
     assert(defaults.blocking_stream_sync && defaults.blocking_event_sync);
     const auto stream_sync = parse({"bench", "--no-blocking-stream-sync"});
     assert(!stream_sync.blocking_stream_sync && stream_sync.blocking_event_sync);

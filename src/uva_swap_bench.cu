@@ -17,6 +17,7 @@ static void usage() {
         "  -e, --element-bytes N   Typed element size: 1, 2, 4, 8 (default 8)\n"
         "  -t, --block-size N      Threads per block (default 256)\n"
         "      --grid-stride       Use the bounded grid-stride kernel (default off)\n"
+        "      --memcpy-async      Swap using cudaMemcpyAsync (default off); extra A on GPU 0\n"
         "  -m, --sm-multiplier N   Grid-stride block cap per SM (default 4)\n"
         "  -n, --iterations N      Timed swaps (default 128)\n"
         "      --no-blocking-stream-sync  Use default stream synchronization\n"
@@ -91,9 +92,19 @@ static void launch_swap(unsigned char* a0, unsigned char* a1, uint64_t elements,
             reinterpret_cast<T*>(a0), reinterpret_cast<T*>(a1), elements);
 }
 
-static void exchange(unsigned char* a0, unsigned char* a1,
+static void exchange(unsigned char* a0, unsigned char* a1, unsigned char* temporary,
                      const uva_p2p::Options& options, unsigned grid,
                      cudaStream_t stream) {
+    if (options.memcpy_async) {
+        // Stream ordering preserves both originals before overwriting either buffer.
+        ATLC_CHECK_CUDA(cudaMemcpyAsync, temporary, a0, options.a_size,
+                       cudaMemcpyDefault, stream);
+        ATLC_CHECK_CUDA(cudaMemcpyAsync, a0, a1, options.a_size,
+                       cudaMemcpyDefault, stream);
+        ATLC_CHECK_CUDA(cudaMemcpyAsync, a1, temporary, options.a_size,
+                       cudaMemcpyDefault, stream);
+        return;
+    }
     const uint64_t elements = options.a_size / options.element_bytes;
     const unsigned block = static_cast<unsigned>(options.block_size);
     switch (options.element_bytes) {
@@ -156,12 +167,17 @@ int main(int argc, char** argv) {
             "A=%zu bytes per GPU, element=%" PRIu64 ", block=%" PRIu64
             ", grid=%" PRIu64 ", iterations=%" PRIu64 "\n",
             options.a_size, options.element_bytes, options.block_size, grid, options.iterations);
-        std::fprintf(stderr, "kernel=%s, SMs=%d, sm_multiplier=%" PRIu64
+        if (options.memcpy_async)
+            std::fprintf(stderr, "copy=cudaMemcpyAsync, temporary=%zu bytes on GPU 0; "
+                         "kernel launch settings unused\n", options.a_size);
+        else
+            std::fprintf(stderr, "kernel=%s, SMs=%d, sm_multiplier=%" PRIu64
             " (used only in grid-stride mode)\n",
             options.grid_stride ? "grid-stride" : "reference",
             properties[0].multiProcessorCount, options.sm_multiplier);
 
         unsigned char* a[2];
+        unsigned char* temporary = nullptr;
         cudaStream_t streams[2];
         std::vector<unsigned char> original[2], actual;
         for (int device = 0; device < 2; ++device) {
@@ -171,10 +187,13 @@ int main(int argc, char** argv) {
             ATLC_CHECK_CUDA(cudaStreamCreate, &streams[device]);
             size_t free_bytes, total_bytes;
             ATLC_CHECK_CUDA(cudaMemGetInfo, &free_bytes, &total_bytes);
-            if (options.a_size > free_bytes)
-                throw std::runtime_error("insufficient free GPU memory for A on GPU " +
+            const size_t buffer_count = device == 0 && options.memcpy_async ? 2 : 1;
+            if (options.a_size > free_bytes / buffer_count)
+                throw std::runtime_error("insufficient free GPU memory for swap buffers on GPU " +
                                          std::to_string(device));
             ATLC_CHECK_CUDA(cudaMalloc, reinterpret_cast<void**>(&a[device]), options.a_size);
+            if (device == 0 && options.memcpy_async)
+                ATLC_CHECK_CUDA(cudaMalloc, reinterpret_cast<void**>(&temporary), options.a_size);
             initialize(a[device], options.a_size, streams[device], 1234ULL + device);
             if (options.validate) {
                 original[device].resize(options.a_size);
@@ -184,7 +203,7 @@ int main(int argc, char** argv) {
         }
         if (options.validate) actual.resize(options.a_size);
         ATLC_CHECK_CUDA(cudaSetDevice, 0);
-        exchange(a[0], a[1], options, static_cast<unsigned>(grid), streams[0]);
+        exchange(a[0], a[1], temporary, options, static_cast<unsigned>(grid), streams[0]);
         ATLC_CHECK_CUDA(cudaStreamSynchronize, streams[0]);
         if (options.validate) validate(a, original, actual, true, "warm-up");
         cudaEvent_t start, stop;
@@ -195,7 +214,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("failed to write CSV header");
         for (uint64_t iteration = 0; iteration < options.iterations; ++iteration) {
             ATLC_CHECK_CUDA(cudaEventRecord, start, streams[0]);
-            exchange(a[0], a[1], options, static_cast<unsigned>(grid), streams[0]);
+            exchange(a[0], a[1], temporary, options, static_cast<unsigned>(grid), streams[0]);
             ATLC_CHECK_CUDA(cudaEventRecord, stop, streams[0]);
             ATLC_CHECK_CUDA(cudaEventSynchronize, stop);
             float elapsed_ms;
@@ -212,6 +231,7 @@ int main(int argc, char** argv) {
         }
         ATLC_CHECK_CUDA(cudaEventDestroy, stop);
         ATLC_CHECK_CUDA(cudaEventDestroy, start);
+        if (temporary) ATLC_CHECK_CUDA(cudaFree, temporary);
         ATLC_CHECK_CUDA(cudaDeviceDisablePeerAccess, 1);
         for (int device = 0; device < 2; ++device) {
             ATLC_CHECK_CUDA(cudaSetDevice, device);

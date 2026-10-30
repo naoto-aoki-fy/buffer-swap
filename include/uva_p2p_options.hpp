@@ -13,6 +13,7 @@ struct Options {
     uint64_t sm_multiplier = 4;
     uint64_t iterations = 128;
     bool grid_stride = false;
+    bool memcpy_async = false;
     bool validate = false;
     bool help = false;
     bool blocking_stream_sync = true, blocking_event_sync = true;
@@ -26,6 +27,7 @@ inline Options parse_options(int argc, char** argv) {
         {"block-size", required_argument, nullptr, 't'},
         {"sm-multiplier", required_argument, nullptr, 'm'},
         {"grid-stride", no_argument, nullptr, 257},
+        {"memcpy-async", no_argument, nullptr, 262},
         {"iterations", required_argument, nullptr, 'n'},
         {"validate", no_argument, nullptr, 256},
         {"blocking-stream-sync", no_argument, nullptr, 258},
@@ -46,6 +48,7 @@ inline Options parse_options(int argc, char** argv) {
             case 'n': result.iterations = bench::positive_integer(optarg); break;
             case 256: result.validate = true; break;
             case 257: result.grid_stride = true; break;
+            case 262: result.memcpy_async = true; break;
             case 258: result.blocking_stream_sync = true; break;
             case 259: result.blocking_event_sync = true; break;
             case 260: result.blocking_stream_sync = false; break;
@@ -68,6 +71,7 @@ inline Options parse_options(int argc, char** argv) {
 inline uint64_t grid_size(const Options& options, uint64_t max_threads,
                           uint64_t max_block_x, uint64_t max_grid_x,
                           uint64_t sm_count) {
+    if (options.memcpy_async) return 0; // No kernel launch in copy mode.
     if (!options.block_size || options.block_size > max_threads ||
         options.block_size > max_block_x || options.block_size > UINT32_MAX)
         throw std::invalid_argument("block size exceeds GPU 0 hardware limits");

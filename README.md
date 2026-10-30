@@ -367,7 +367,7 @@ The program checks `cudaDeviceCanAccessPeer(0, 1)` and enables that direction
 using `cudaDeviceEnablePeerAccess`. Only GPU 0 executes the swap kernel, so
 reverse peer access is unnecessary. Unsupported UVA/P2P fails with an error.
 Each GPU needs **32 GiB free for A, plus CUDA/cuRAND overhead**, by default.
-Initialization allocates no additional application GPU staging or communication
+By default, initialization allocates no additional application GPU staging or communication
 buffer; cuRAND and CUDA may require internal resources. Reduce A for smaller GPUs.
 
 **A successful CUDA P2P check does not prove NVLink connectivity.** Before
@@ -405,6 +405,7 @@ Launch directly, without a multi-process launcher:
 | `-e`, `--element-bytes N` | Unsigned typed access width: 1, 2, 4 or 8 bytes | `8` |
 | `-t`, `--block-size N` | CUDA threads per block | `256` |
 | `--grid-stride` | Use a bounded grid with thread reuse | Disabled (reference kernel) |
+| `--memcpy-async` | Swap with three `cudaMemcpyAsync` calls and an extra A-sized buffer on GPU 0 | Disabled |
 | `-m`, `--sm-multiplier N` | Block cap per SM in grid-stride mode | `4` |
 | `-n`, `--iterations N` | Timed complete swaps | `128` |
 | `--no-blocking-stream-sync` | Use CUDA's default stream synchronization scheduling | Disabled |
@@ -415,7 +416,7 @@ Launch directly, without a multi-process launcher:
 Sizes use the existing positive decimal and binary K/M/G suffix conventions.
 A must be divisible by the element width. Other widths, zero, signs, overflow,
 unknown options, missing arguments and positional arguments are rejected.
-Block size is checked against GPU 0's thread and block-x limits. The default
+In kernel mode, block size is checked against GPU 0's thread and block-x limits. The default
 reference kernel uses `floor((A bytes / element bytes) / block size) + 1`,
 enforcing the strict inequality `block_size * grid_size * element_bytes > A bytes`, even for exact
 multiples. Grid limits and 64-bit coverage overflow are checked before launch.
@@ -450,7 +451,22 @@ different seeds. For 1/2-byte sizes, a cuRAND device kernel fills any trailing
 bytes that cannot be generated as whole 32-bit words. GPU 0's kernel performs
 one local load, one direct UVA peer load, and two opposite stores per element.
 Each valid index belongs to exactly one thread. No second swap kernel runs on
-GPU 1, and the exchange uses no copy API or extra GPU buffer.
+GPU 1, and the default exchange uses no copy API or extra GPU buffer.
+
+Add `--memcpy-async` to exchange the buffers using `cudaMemcpyAsync` with
+`cudaMemcpyDefault`: A0 to a temporary buffer on GPU 0, A1 to A0, then the
+temporary buffer to A1. All three copies run in order on GPU 0's stream and
+are included in the timed interval. The temporary buffer is allocated once
+before warm-up and freed after timing. GPU 0 requires space for **2 * A**
+(64 GiB with the default A), plus runtime overhead; GPU 1 still requires A.
+This mode takes precedence over `--grid-stride`; block size and SM multiplier
+do not control the copies, and grid size is reported as 0. Existing argument
+checks, including element-width divisibility, still apply. The CSV schema is
+unchanged, and stderr identifies `copy=cudaMemcpyAsync`.
+
+```bash
+./bin/uva_swap_bench --memcpy-async -a 1M -n 3 --validate
+```
 
 ### Timing, CSV and validation
 
