@@ -20,6 +20,18 @@ static bench::Options parse(std::vector<std::string> args) {
 
 int main() {
     const auto defaults = parse({"bench"});
+    assert(defaults.pipeline_copy_back);
+    const auto serial = parse({"bench", "--no-pipeline-copy-back"});
+    assert(!serial.pipeline_copy_back && serial.copy_back);
+    assert(parse({"bench", "--pipeline-copy-back"}).pipeline_copy_back);
+    assert(parse({"bench", "--no-pipeline-copy-back", "--pipeline-copy-back"}).pipeline_copy_back);
+    assert(!parse({"bench", "--pipeline-copy-back", "--no-pipeline-copy-back"}).pipeline_copy_back);
+    for (const auto* flag : {"--pipeline-copy-back", "--no-pipeline-copy-back"}) {
+        const auto skipped = parse({"bench", flag, "--skip-copy-back"});
+        assert(!skipped.copy_back);
+        assert(skipped.pipeline_copy_back == (std::string(flag) == "--pipeline-copy-back"));
+        rejects([&] { parse({"bench", std::string(flag) + "=1"}); });
+    }
     assert(defaults.blocking_stream_sync && defaults.blocking_event_sync);
     const auto stream_sync = parse({"bench", "--no-blocking-stream-sync"});
     assert(!stream_sync.blocking_stream_sync && stream_sync.blocking_event_sync);

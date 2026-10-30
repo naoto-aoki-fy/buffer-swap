@@ -3,12 +3,14 @@
 `bin/nccl_swap_bench` is a two-rank GPU communication benchmark for two GPUs
 in one node or separate compute nodes connected by InfiniBand. Each rank owns
 a main GPU buffer A and a smaller receive buffer B. Consecutive chunks of A are sent to the peer using
-grouped `ncclSend`/`ncclRecv` on one communication stream. B is split into two
+grouped `ncclSend`/`ncclRecv` on one communication stream. By default, B is split into two
 staging slots of `floor(B / 2)` bytes, and a separate copy stream writes received
 chunks into A while communication proceeds into the other slot. Events protect
 the outgoing A data and prevent slot reuse until its previous copy finishes.
 The final chunk can be smaller than a slot. Only these two data buffers are
 allocated, using `cudaMalloc` and initialized with cuRAND.
+Use `--no-pipeline-copy-back` to serialize communication and copy-back with
+one staging slot using all of B.
 
 ## Build
 
@@ -69,9 +71,11 @@ use the same settings.
 | Option | Meaning | Default |
 |---|---|---|
 | `-a`, `--a-size SIZE` | A size in bytes | `32G` (32 GiB) |
-| `-b`, `--b-size SIZE` | Total B size in bytes (two staging slots in copy mode) | `1G` (1 GiB) |
+| `-b`, `--b-size SIZE` | Total B size in bytes (two slots when pipelined) | `1G` (1 GiB) |
 | `-n`, `--iterations N` | Number of timed full-A exchanges | `128` |
 | `--skip-copy-back` | Omit B-to-A device copies; A remains unchanged | Disabled |
+| `--pipeline-copy-back` | Pipeline B-to-A copies using two slots and a separate copy stream | Enabled |
+| `--no-pipeline-copy-back` | Use all of B as one slot; serialize communication and B-to-A copies | Disabled |
 | `--no-blocking-stream-sync` | Use CUDA's default stream synchronization scheduling | Disabled |
 | `--no-blocking-event-sync` | Use CUDA's default stop-event synchronization | Disabled |
 | `--validate` | Compare every byte of A after warm-up and each timed iteration | Disabled |
@@ -87,12 +91,17 @@ storage bounded. The default buffers require **33 GiB free GPU memory per
 rank plus CUDA/cuRAND/NCCL overhead**; reduce the sizes for smaller GPUs.
 Allocation errors and insufficient memory abort the MPI job.
 
-The two slots share the existing B allocation: default B=1 GiB gives two
+The pipeline is enabled by default; `--no-pipeline-copy-back` disables it and
+`--pipeline-copy-back` enables it explicitly. If both are supplied, the last
+one wins. These options apply to the NCCL benchmark. With the pipeline enabled,
+the two slots share the existing B allocation: default B=1 GiB gives two
 512 MiB slots. Odd B sizes leave one byte unused. B=1 falls back to serial
 one-byte transfers and copies on the communication stream. `--skip-copy-back`
-uses all of B as a single receive slot, with no copy stream. Each rank reports
-the effective slot count and chunk size on stderr. Compared with the former
-serial implementation at the same total B, the pipeline uses smaller chunks;
+uses all of B as a single receive slot, with no copy stream, regardless of the
+pipeline setting. Disabling the pipeline retains copy-back, uses all B bytes
+per full chunk, and creates no copy stream or slot events. Each rank reports
+the effective slot count and chunk size on stderr; the CSV schema is unchanged.
+Compared with serial mode at the same total B, the pipeline uses smaller chunks;
 measure performance on the target hardware rather than assuming a speedup.
 
 ## Launch on two nodes
@@ -151,6 +160,10 @@ CUDA_VISIBLE_DEVICES=0,1 mpirun -np 2 --map-by ppr:2:node \
 CUDA_VISIBLE_DEVICES=0,1 mpirun -np 2 --map-by ppr:2:node \
     ./bin/nccl_swap_bench -a 1003 -b 257 -n 3 --validate --skip-copy-back \
     > results-skip.csv 2> diagnostics-skip.log
+# Validate serial copy-back with a single staging slot:
+CUDA_VISIBLE_DEVICES=0,1 mpirun -np 2 --map-by ppr:2:node \
+    ./bin/nccl_swap_bench -a 1003 -b 257 -n 3 --validate --no-pipeline-copy-back \
+    > results-serial.csv 2> diagnostics-serial.log
 ```
 
 Local runs clear `NCCL_NET` and let NCCL select its available transports,
@@ -216,8 +229,10 @@ Allocation, cuRAND initialization, communicator setup and one untimed full-A
 warm-up exchange run before timing. The warm-up follows the chosen copy mode;
 in normal mode it swaps A once. Each timed iteration synchronizes ranks with
 an MPI barrier, then records start and stop CUDA events on the communication
-stream around the entire chunk loop. This stream waits for the final copy-back
-before recording stop, so timing includes both streams and pipeline draining.
+stream around the entire chunk loop. With pipelining enabled, this stream waits
+for the final copy-back before recording stop, so timing includes both streams
+and pipeline draining. With pipelining disabled, communication and copies run
+on the same stream and are both included in timing.
 The stop event is synchronized before reading
 `cudaEventElapsedTime`. MPI reduces the two local event times with `MPI_MAX`
 after the stop event; rank 0 reports that maximum in milliseconds.
@@ -284,7 +299,8 @@ g++ -std=c++17 -Wall -Wextra -Werror -Iinclude tests/bench_options_test.cpp -o /
 /tmp/bench_options_test
 ```
 
-They cover defaults, binary suffixes, arbitrary byte sizes, copy mode,
+They cover defaults, binary suffixes, arbitrary byte sizes, copy mode, pipeline
+toggles and their precedence,
 validation bounds, invalid options, missing arguments, unsigned integer
 limits, size multiplication overflow and combined allocation overflow.
 GPU correctness, timing and transport verification require the actual
@@ -292,7 +308,8 @@ CUDA/NCCL/MPI and either a two-GPU node or two-node InfiniBand environment.
 
 The NCCL runtime suite covers one/two/three chunks, repeated slot reuse, odd
 sizes, partial tails, B>A, B=1, skip-copy mode, and both iteration parities.
-It validates warm-up and every timed exchange, and checks CSV output:
+It runs with pipelining both enabled and disabled, validates warm-up and every
+timed exchange, and checks CSV output and effective slot/chunk sizes:
 
 ```bash
 python3 tests/nccl_swap_runtime_test.py ./bin/nccl_swap_bench \

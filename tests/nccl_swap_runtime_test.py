@@ -23,12 +23,13 @@ def main():
         parser.error('--stress-iterations must be at least 2')
     cases = 0
 
-    def validate_case(a_size, b_size, copy_back, iterations):
+    def validate_case(a_size, b_size, copy_back, iterations, pipeline):
         nonlocal cases
         command = shlex.split(args.launcher) + [args.binary, '-a', str(a_size),
                     '-b', str(b_size), '-n', str(iterations), '--validate']
         if not copy_back:
             command.append('--skip-copy-back')
+        command.append('--pipeline-copy-back' if pipeline else '--no-pipeline-copy-back')
         result = subprocess.run(command, text=True, capture_output=True, timeout=args.timeout)
         assert result.returncode == 0, (command, result.stdout, result.stderr)
         rows = list(csv.reader(io.StringIO(result.stdout)))
@@ -38,7 +39,7 @@ def main():
             assert tuple(map(int, row[:-1])) == (iteration, a_size, b_size, int(copy_back)), row
             elapsed = float(row[-1])
             assert math.isfinite(elapsed) and elapsed >= 0, row
-        slots = 2 if copy_back and b_size >= 2 else 1
+        slots = 2 if pipeline and copy_back and b_size >= 2 else 1
         for rank in [0, 1]:
             assert f'rank {rank}: warm-up and all timed swaps validated' in result.stderr, result.stderr
             assert (f'rank {rank}: staging_slots={slots} chunk_bytes={b_size // slots}'
@@ -55,10 +56,12 @@ def main():
                 (1025, 2048),               # B>A but A needs both half-B slots.
             ]:
                 for iterations in [2, 3]:
-                    validate_case(a_size, b_size, copy_back, iterations)
+                    for pipeline in [True, False]:
+                        validate_case(a_size, b_size, copy_back, iterations, pipeline)
         # Many slot reuses and alternating swap parities, exact and partial tails.
         for a_size, b_size in [(8192, 128), (8193, 129)]:
-            validate_case(a_size, b_size, copy_back, args.stress_iterations)
+            for pipeline in [True, False]:
+                validate_case(a_size, b_size, copy_back, args.stress_iterations, pipeline)
     print(f'{cases} NCCL validation/CSV cases passed')
 
 

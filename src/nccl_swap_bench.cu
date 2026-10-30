@@ -22,9 +22,11 @@ static void usage() {
     std::fprintf(stderr,
         "Usage: nccl_swap_bench [options] (exactly two ranks, one GPU per rank)\n"
         "  -a, --a-size SIZE       Main buffer bytes (default 32G)\n"
-        "  -b, --b-size SIZE       Total staging bytes, split into two slots (default 1G)\n"
+        "  -b, --b-size SIZE       Total staging bytes (default 1G)\n"
         "  -n, --iterations N      Timed exchanges (default 128)\n"
         "      --skip-copy-back    Leave A unchanged; omit B-to-A copies\n"
+        "      --pipeline-copy-back     Use two slots and a separate copy stream (default)\n"
+        "      --no-pipeline-copy-back  Use one slot; serialize communication and copies\n"
         "      --no-blocking-stream-sync  Use default stream synchronization\n"
         "      --no-blocking-event-sync   Use default event synchronization\n"
         "      --validate          Check warm-up and every iteration; A/B <= 16M\n"
@@ -70,7 +72,7 @@ static void exchange(unsigned char* a, unsigned char* b,
                      const ExchangePipeline& pipeline) {
     // Keep the total B allocation fixed. An odd B leaves one byte unused.
     // B=1 cannot hold two slots; skip-copy mode needs no copy pipeline.
-    const bool pipelined = options.copy_back && options.b_size >= 2;
+    const bool pipelined = options.pipeline_copy_back && options.copy_back && options.b_size >= 2;
     const size_t chunk_size = pipelined ? options.b_size / 2 : options.b_size;
     bool used[2] = {};
     unsigned slot = 0;
@@ -118,13 +120,14 @@ int main(int argc, char** argv) {
         const uint64_t configuration[] = {options.a_size, options.b_size,
             options.iterations, uint64_t(options.copy_back),
             uint64_t(options.validate), uint64_t(options.help),
-            uint64_t(options.blocking_stream_sync), uint64_t(options.blocking_event_sync)};
-        uint64_t minimum[8], maximum[8];
-        ATLC_CHECK_MPI(MPI_Allreduce, configuration, minimum, 8, MPI_UINT64_T,
+            uint64_t(options.blocking_stream_sync), uint64_t(options.blocking_event_sync),
+            uint64_t(options.pipeline_copy_back)};
+        uint64_t minimum[9], maximum[9];
+        ATLC_CHECK_MPI(MPI_Allreduce, configuration, minimum, 9, MPI_UINT64_T,
                        MPI_MIN, MPI_COMM_WORLD);
-        ATLC_CHECK_MPI(MPI_Allreduce, configuration, maximum, 8, MPI_UINT64_T,
+        ATLC_CHECK_MPI(MPI_Allreduce, configuration, maximum, 9, MPI_UINT64_T,
                        MPI_MAX, MPI_COMM_WORLD);
-        if (!std::equal(minimum, minimum + 8, maximum))
+        if (!std::equal(minimum, minimum + 9, maximum))
             throw std::runtime_error("all ranks must use identical command-line options");
         if (options.help) {
             if (rank == 0) usage();
@@ -172,7 +175,7 @@ int main(int argc, char** argv) {
                      rank, hostname_length, hostname, device, properties.name,
                      options.a_size, options.b_size, int(options.copy_back),
                      local_size == 2 ? "single-node" : "two-node");
-        const bool pipelined = options.copy_back && options.b_size >= 2;
+        const bool pipelined = options.pipeline_copy_back && options.copy_back && options.b_size >= 2;
         std::fprintf(stderr, "rank %d: staging_slots=%d chunk_bytes=%zu\n", rank,
                      pipelined ? 2 : 1, pipelined ? options.b_size / 2 : options.b_size);
 

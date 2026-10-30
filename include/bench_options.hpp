@@ -13,6 +13,7 @@ struct Options {
     size_t b_size = size_t{1} << 30;
     uint64_t iterations = 128;
     bool copy_back = true;
+    bool pipeline_copy_back = true;
     bool validate = false;
     bool help = false;
     bool blocking_stream_sync = true, blocking_event_sync = true;
@@ -60,6 +61,8 @@ inline Options parse_options(int argc, char** argv) {
         {"blocking-event-sync", no_argument, nullptr, 259},
         {"no-blocking-stream-sync", no_argument, nullptr, 260},
         {"no-blocking-event-sync", no_argument, nullptr, 261},
+        {"pipeline-copy-back", no_argument, nullptr, 262},
+        {"no-pipeline-copy-back", no_argument, nullptr, 263},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
@@ -76,6 +79,8 @@ inline Options parse_options(int argc, char** argv) {
             case 259: result.blocking_event_sync = true; break;
             case 260: result.blocking_stream_sync = false; break;
             case 261: result.blocking_event_sync = false; break;
+            case 262: result.pipeline_copy_back = true; break;
+            case 263: result.pipeline_copy_back = false; break;
             case 'h': result.help = true; break;
             default: throw std::invalid_argument("unknown option or missing option argument");
         }
