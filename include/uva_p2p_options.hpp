@@ -15,6 +15,7 @@ struct Options {
     bool grid_stride = false;
     bool validate = false;
     bool help = false;
+    bool blocking_stream_sync = false, blocking_event_sync = false;
 };
 
 inline Options parse_options(int argc, char** argv) {
@@ -27,6 +28,8 @@ inline Options parse_options(int argc, char** argv) {
         {"grid-stride", no_argument, nullptr, 257},
         {"iterations", required_argument, nullptr, 'n'},
         {"validate", no_argument, nullptr, 256},
+        {"blocking-stream-sync", no_argument, nullptr, 258},
+        {"blocking-event-sync", no_argument, nullptr, 259},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
@@ -41,6 +44,8 @@ inline Options parse_options(int argc, char** argv) {
             case 'n': result.iterations = bench::positive_integer(optarg); break;
             case 256: result.validate = true; break;
             case 257: result.grid_stride = true; break;
+            case 258: result.blocking_stream_sync = true; break;
+            case 259: result.blocking_event_sync = true; break;
             case 'h': result.help = true; break;
             default: throw std::invalid_argument("unknown option or missing option argument");
         }

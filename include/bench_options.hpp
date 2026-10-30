@@ -15,6 +15,7 @@ struct Options {
     bool copy_back = true;
     bool validate = false;
     bool help = false;
+    bool blocking_stream_sync = false, blocking_event_sync = false;
 };
 
 // Strict unsigned decimal parsing: reject signs, whitespace and overflow.
@@ -55,6 +56,8 @@ inline Options parse_options(int argc, char** argv) {
         {"iterations", required_argument, nullptr, 'n'},
         {"skip-copy-back", no_argument, nullptr, 256},
         {"validate", no_argument, nullptr, 257},
+        {"blocking-stream-sync", no_argument, nullptr, 258},
+        {"blocking-event-sync", no_argument, nullptr, 259},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
@@ -67,6 +70,8 @@ inline Options parse_options(int argc, char** argv) {
             case 'n': result.iterations = positive_integer(optarg); break;
             case 256: result.copy_back = false; break;
             case 257: result.validate = true; break;
+            case 258: result.blocking_stream_sync = true; break;
+            case 259: result.blocking_event_sync = true; break;
             case 'h': result.help = true; break;
             default: throw std::invalid_argument("unknown option or missing option argument");
         }

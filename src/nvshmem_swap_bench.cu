@@ -28,6 +28,8 @@ static void usage() {
         "  -m, --sm-multiplier N   Blocks per SM (default 1)\n"
         "  -n, --iterations N      Timed full swaps (default 128)\n"
         "      --method N          1: symmetric GET (default), 2: registered PUT, 3: staged GET\n"
+        "      --blocking-stream-sync  Block CPU during stream synchronization\n"
+        "      --blocking-event-sync   Block CPU during event synchronization\n"
         "      --validate          Verify warm-up and every swap; A <= 16M\n"
         "  -h, --help              Show help on stderr\n"
         "SIZE: positive integer with binary K/M/G suffix. Set NVSHMEM_SYMMETRIC_SIZE\n"
@@ -153,8 +155,9 @@ int main(int argc, char** argv) {
         ATLC_CHECK_MPI(MPI_Comm_rank, MPI_COMM_WORLD, &rank);
         const auto o = nvshmem_swap::parse_options(argc, argv);
         const uint64_t config[] = {o.a_size, o.chunk_size, o.element_bytes, o.block_size, o.sm_multiplier,
-                                   o.iterations, uint64_t(o.validate), uint64_t(o.help), o.method};
-        matching(config, 9);
+                                   o.iterations, uint64_t(o.validate), uint64_t(o.help), o.method,
+                                   uint64_t(o.blocking_stream_sync), uint64_t(o.blocking_event_sync)};
+        matching(config, 11);
         if (o.help) {
             if (!rank) usage();
             ATLC_CHECK_MPI(MPI_Finalize);
@@ -179,6 +182,8 @@ int main(int argc, char** argv) {
         const int device = devices == 1 ? 0 : local_rank;
         if (device >= devices)
             throw std::runtime_error("not enough visible CUDA devices for local MPI ranks");
+        if (o.blocking_stream_sync)
+            ATLC_CHECK_CUDA(cudaSetDeviceFlags, cudaDeviceScheduleBlockingSync);
         ATLC_CHECK_CUDA(cudaSetDevice, device);
         cudaDeviceProp prop;
         ATLC_CHECK_CUDA(cudaGetDeviceProperties, &prop, device);
@@ -313,7 +318,8 @@ int main(int argc, char** argv) {
         validate(true);
         cudaEvent_t start, stop;
         ATLC_CHECK_CUDA(cudaEventCreate, &start);
-        ATLC_CHECK_CUDA(cudaEventCreate, &stop);
+        ATLC_CHECK_CUDA(cudaEventCreateWithFlags, &stop,
+                        o.blocking_event_sync ? cudaEventBlockingSync : cudaEventDefault);
         if (!rank) std::printf("iteration,buffer_a_bytes,buffer_b_bytes,element_bytes,block_size,sm_multiplier,grid_blocks,chunk_bytes,elapsed_ms\n");
         for (uint64_t i = 0; i < o.iterations; ++i) {
             generation = (i + 1) * l.signal_generations;

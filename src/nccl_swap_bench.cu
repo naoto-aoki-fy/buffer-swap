@@ -25,6 +25,8 @@ static void usage() {
         "  -b, --b-size SIZE       Total staging bytes, split into two slots (default 1G)\n"
         "  -n, --iterations N      Timed exchanges (default 128)\n"
         "      --skip-copy-back    Leave A unchanged; omit B-to-A copies\n"
+        "      --blocking-stream-sync  Block CPU during stream synchronization\n"
+        "      --blocking-event-sync   Block CPU during event synchronization\n"
         "      --validate          Check warm-up and every iteration; A/B <= 16M\n"
         "  -h, --help              Show this help on stderr\n"
         "SIZE is a positive integer with optional K/M/G suffix (binary units).\n");
@@ -115,13 +117,14 @@ int main(int argc, char** argv) {
         const auto options = bench::parse_options(argc, argv);
         const uint64_t configuration[] = {options.a_size, options.b_size,
             options.iterations, uint64_t(options.copy_back),
-            uint64_t(options.validate), uint64_t(options.help)};
-        uint64_t minimum[6], maximum[6];
-        ATLC_CHECK_MPI(MPI_Allreduce, configuration, minimum, 6, MPI_UINT64_T,
+            uint64_t(options.validate), uint64_t(options.help),
+            uint64_t(options.blocking_stream_sync), uint64_t(options.blocking_event_sync)};
+        uint64_t minimum[8], maximum[8];
+        ATLC_CHECK_MPI(MPI_Allreduce, configuration, minimum, 8, MPI_UINT64_T,
                        MPI_MIN, MPI_COMM_WORLD);
-        ATLC_CHECK_MPI(MPI_Allreduce, configuration, maximum, 6, MPI_UINT64_T,
+        ATLC_CHECK_MPI(MPI_Allreduce, configuration, maximum, 8, MPI_UINT64_T,
                        MPI_MAX, MPI_COMM_WORLD);
-        if (!std::equal(minimum, minimum + 6, maximum))
+        if (!std::equal(minimum, minimum + 8, maximum))
             throw std::runtime_error("all ranks must use identical command-line options");
         if (options.help) {
             if (rank == 0) usage();
@@ -148,6 +151,8 @@ int main(int argc, char** argv) {
         const int device = devices == 1 ? 0 : local_rank;
         if (device >= devices)
             throw std::runtime_error("not enough visible CUDA devices for local MPI ranks");
+        if (options.blocking_stream_sync)
+            ATLC_CHECK_CUDA(cudaSetDeviceFlags, cudaDeviceScheduleBlockingSync);
         ATLC_CHECK_CUDA(cudaSetDevice, device);
         cudaDeviceProp properties;
         ATLC_CHECK_CUDA(cudaGetDeviceProperties, &properties, device);
@@ -236,7 +241,8 @@ int main(int argc, char** argv) {
         }
         cudaEvent_t start, stop;
         ATLC_CHECK_CUDA(cudaEventCreate, &start);
-        ATLC_CHECK_CUDA(cudaEventCreate, &stop);
+        ATLC_CHECK_CUDA(cudaEventCreateWithFlags, &stop,
+                        options.blocking_event_sync ? cudaEventBlockingSync : cudaEventDefault);
         if (rank == 0)
             std::printf("iteration,buffer_a_bytes,buffer_b_bytes,copy_back,elapsed_ms\n");
         for (uint64_t iteration = 0; iteration < options.iterations; ++iteration) {

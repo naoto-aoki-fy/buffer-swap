@@ -56,6 +56,15 @@ that path as the target, for example `make UVA_BENCH_BIN=bin/uva_custom bin/uva_
 No CMake or generated argument parser is required. `make clean` removes all
 three configured executable paths.
 
+## Synchronization options
+
+All three benchmarks accept `--blocking-stream-sync` to set
+`cudaDeviceScheduleBlockingSync` on each used GPU and `--blocking-event-sync`
+to create the synchronized stop event with `cudaEventBlockingSync`. They are
+independent; without either option CUDA uses its default scheduling/event flags.
+These settings affect host waiting behavior and can affect benchmark results.
+All MPI ranks must use the same settings.
+
 ## Options
 
 | Option | Meaning | Default |
@@ -64,6 +73,8 @@ three configured executable paths.
 | `-b`, `--b-size SIZE` | Total B size in bytes (two staging slots in copy mode) | `1G` (1 GiB) |
 | `-n`, `--iterations N` | Number of timed full-A exchanges | `128` |
 | `--skip-copy-back` | Omit B-to-A device copies; A remains unchanged | Disabled |
+| `--blocking-stream-sync` | Block the CPU during CUDA stream synchronization | Disabled |
+| `--blocking-event-sync` | Block the CPU during CUDA stop-event synchronization | Disabled |
 | `--validate` | Compare every byte of A after warm-up and each timed iteration | Disabled |
 | `-h`, `--help` | Print help to stderr and exit | |
 
@@ -380,6 +391,8 @@ Launch directly, without a multi-process launcher:
 | `--grid-stride` | Use a bounded grid with thread reuse | Disabled (reference kernel) |
 | `-m`, `--sm-multiplier N` | Block cap per SM in grid-stride mode | `4` |
 | `-n`, `--iterations N` | Timed complete swaps | `128` |
+| `--blocking-stream-sync` | Block the CPU during CUDA stream synchronization | Disabled |
+| `--blocking-event-sync` | Block the CPU during CUDA stop-event synchronization | Disabled |
 | `--validate` | Compare both buffers after warm-up and every timed swap | Disabled |
 | `-h`, `--help` | Print help to stderr without accessing CUDA | |
 
@@ -543,6 +556,8 @@ See NVIDIA's [NVSHMEM compilation and MPI interoperability guide](https://docs.n
 | `-m`, `--sm-multiplier N` | Multiplier of the GPU SM count | `1` |
 | `-n`, `--iterations N` | Timed complete swaps | `128` |
 | `--method N` | 1: symmetric GET, 2: registered PUT, 3: staged GET | `1` |
+| `--blocking-stream-sync` | Block the CPU during CUDA stream synchronization | Disabled |
+| `--blocking-event-sync` | Block the CPU during CUDA stop-event synchronization | Disabled |
 | `--validate` | Verify warm-up and every timed swap, both ranks | Disabled |
 | `-h`, `--help` | Usage on stderr, without CUDA/NVSHMEM initialization | |
 
