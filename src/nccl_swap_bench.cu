@@ -25,8 +25,8 @@ static void usage() {
         "  -b, --b-size SIZE       Total staging bytes, split into two slots (default 1G)\n"
         "  -n, --iterations N      Timed exchanges (default 128)\n"
         "      --skip-copy-back    Leave A unchanged; omit B-to-A copies\n"
-        "      --blocking-stream-sync  Block CPU during stream synchronization\n"
-        "      --blocking-event-sync   Block CPU during event synchronization\n"
+        "      --no-blocking-stream-sync  Use default stream synchronization\n"
+        "      --no-blocking-event-sync   Use default event synchronization\n"
         "      --validate          Check warm-up and every iteration; A/B <= 16M\n"
         "  -h, --help              Show this help on stderr\n"
         "SIZE is a positive integer with optional K/M/G suffix (binary units).\n");

@@ -20,15 +20,15 @@ static bench::Options parse(std::vector<std::string> args) {
 
 int main() {
     const auto defaults = parse({"bench"});
-    assert(!defaults.blocking_stream_sync && !defaults.blocking_event_sync);
-    const auto stream_sync = parse({"bench", "--blocking-stream-sync"});
-    assert(stream_sync.blocking_stream_sync && !stream_sync.blocking_event_sync);
-    const auto event_sync = parse({"bench", "--blocking-event-sync"});
-    assert(!event_sync.blocking_stream_sync && event_sync.blocking_event_sync);
-    const auto both_sync = parse({"bench", "--blocking-stream-sync", "--blocking-event-sync"});
-    assert(both_sync.blocking_stream_sync && both_sync.blocking_event_sync);
-    rejects([&] { parse({"bench", "--blocking-stream-sync=1"}); });
-    rejects([&] { parse({"bench", "--blocking-event-sync=1"}); });
+    assert(defaults.blocking_stream_sync && defaults.blocking_event_sync);
+    const auto stream_sync = parse({"bench", "--no-blocking-stream-sync"});
+    assert(!stream_sync.blocking_stream_sync && stream_sync.blocking_event_sync);
+    const auto event_sync = parse({"bench", "--no-blocking-event-sync"});
+    assert(event_sync.blocking_stream_sync && !event_sync.blocking_event_sync);
+    const auto both_sync = parse({"bench", "--no-blocking-stream-sync", "--no-blocking-event-sync"});
+    assert(!both_sync.blocking_stream_sync && !both_sync.blocking_event_sync);
+    rejects([&] { parse({"bench", "--no-blocking-stream-sync=1"}); });
+    rejects([&] { parse({"bench", "--no-blocking-event-sync=1"}); });
     assert(defaults.a_size == 34359738368ULL && defaults.b_size == 1073741824ULL);
     assert(defaults.iterations == 128 && defaults.copy_back && !defaults.validate);
     assert(bench::parse_size("1") == 1);

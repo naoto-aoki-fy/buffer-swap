@@ -10,7 +10,7 @@ struct Options {
     uint64_t element_bytes = 8, block_size = 256, sm_multiplier = 1, iterations = 128;
     uint64_t method = 1;
     bool validate = false, help = false;
-    bool blocking_stream_sync = false, blocking_event_sync = false;
+    bool blocking_stream_sync = true, blocking_event_sync = true;
 };
 inline Options parse_options(int argc, char** argv) {
     Options o;
@@ -25,6 +25,8 @@ inline Options parse_options(int argc, char** argv) {
         {"method", required_argument, nullptr, 257},
         {"blocking-stream-sync", no_argument, nullptr, 258},
         {"blocking-event-sync", no_argument, nullptr, 259},
+        {"no-blocking-stream-sync", no_argument, nullptr, 260},
+        {"no-blocking-event-sync", no_argument, nullptr, 261},
         {"help", no_argument, nullptr, 'h'}, {nullptr, 0, nullptr, 0}
     };
     opterr = 0;
@@ -41,6 +43,8 @@ inline Options parse_options(int argc, char** argv) {
             case 257: o.method = bench::positive_integer(optarg); break;
             case 258: o.blocking_stream_sync = true; break;
             case 259: o.blocking_event_sync = true; break;
+            case 260: o.blocking_stream_sync = false; break;
+            case 261: o.blocking_event_sync = false; break;
             case 'h': o.help = true; break;
             default: throw std::invalid_argument("unknown option or missing option argument");
         }
