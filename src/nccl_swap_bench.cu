@@ -1,3 +1,4 @@
+#include "cuda_sync.hpp"
 #include <cuda_runtime.h>
 #include <curand.h>
 #include <curand_kernel.h>
@@ -29,6 +30,12 @@ static void usage() {
         "      --no-pipeline-copy-back  Use one slot; serialize communication and copies\n"
         "      --no-blocking-stream-sync  Use default stream synchronization\n"
         "      --no-blocking-event-sync   Use default event synchronization\n"
+        "      --stream-query              Poll cudaStreamQuery instead of synchronizing\n"
+        "      --event-query               Poll cudaEventQuery instead of synchronizing\n"
+        "      --query-yield               Yield the host thread after each not-ready query\n"
+        "      --no-stream-query           Disable stream polling (default)\n"
+        "      --no-event-query            Disable event polling (default)\n"
+        "      --no-query-yield            Disable yielding while polling (default)\n"
         "      --validate          Check warm-up and every iteration; A/B <= 16M\n"
         "  -h, --help              Show this help on stderr\n"
         "SIZE is a positive integer with optional K/M/G suffix (binary units).\n");
@@ -121,13 +128,14 @@ int main(int argc, char** argv) {
             options.iterations, uint64_t(options.copy_back),
             uint64_t(options.validate), uint64_t(options.help),
             uint64_t(options.blocking_stream_sync), uint64_t(options.blocking_event_sync),
-            uint64_t(options.pipeline_copy_back)};
-        uint64_t minimum[9], maximum[9];
-        ATLC_CHECK_MPI(MPI_Allreduce, configuration, minimum, 9, MPI_UINT64_T,
+            uint64_t(options.pipeline_copy_back), uint64_t(options.stream_query),
+            uint64_t(options.event_query), uint64_t(options.query_yield)};
+        uint64_t minimum[12], maximum[12];
+        ATLC_CHECK_MPI(MPI_Allreduce, configuration, minimum, 12, MPI_UINT64_T,
                        MPI_MIN, MPI_COMM_WORLD);
-        ATLC_CHECK_MPI(MPI_Allreduce, configuration, maximum, 9, MPI_UINT64_T,
+        ATLC_CHECK_MPI(MPI_Allreduce, configuration, maximum, 12, MPI_UINT64_T,
                        MPI_MAX, MPI_COMM_WORLD);
-        if (!std::equal(minimum, minimum + 9, maximum))
+        if (!std::equal(minimum, minimum + 12, maximum))
             throw std::runtime_error("all ranks must use identical command-line options");
         if (options.help) {
             if (rank == 0) usage();
@@ -154,7 +162,7 @@ int main(int argc, char** argv) {
         const int device = devices == 1 ? 0 : local_rank;
         if (device >= devices)
             throw std::runtime_error("not enough visible CUDA devices for local MPI ranks");
-        if (options.blocking_stream_sync)
+        if (options.blocking_stream_sync && !options.stream_query)
             ATLC_CHECK_CUDA(cudaSetDeviceFlags, cudaDeviceScheduleBlockingSync);
         ATLC_CHECK_CUDA(cudaSetDevice, device);
         cudaDeviceProp properties;
@@ -215,7 +223,7 @@ int main(int argc, char** argv) {
         ATLC_CHECK_CURAND(curandSetStream, rng, stream);
         initialize(a, options.a_size, rng, stream, 1234ULL + rank * 2);
         initialize(b, options.b_size, rng, stream, 1235ULL + rank * 2);
-        ATLC_CHECK_CUDA(cudaStreamSynchronize, stream);
+        ATLC_CHECK_CUDA(bench::wait_stream, stream, options.stream_query, options.query_yield);
         ATLC_CHECK_CURAND(curandDestroyGenerator, rng);
 
         // Validation uses bounded host snapshots only as references. The actual
@@ -235,7 +243,7 @@ int main(int argc, char** argv) {
         // Validate warm-up against the initial data, before it can mask errors.
         ATLC_CHECK_MPI(MPI_Barrier, MPI_COMM_WORLD);
         exchange(a, b, options, rank, comm, stream, pipeline);
-        ATLC_CHECK_CUDA(cudaStreamSynchronize, stream);
+        ATLC_CHECK_CUDA(bench::wait_stream, stream, options.stream_query, options.query_yield);
         if (options.validate) {
             ATLC_CHECK_CUDA(cudaMemcpy, actual.data(), a, options.a_size,
                            cudaMemcpyDeviceToHost);
@@ -245,7 +253,7 @@ int main(int argc, char** argv) {
         cudaEvent_t start, stop;
         ATLC_CHECK_CUDA(cudaEventCreate, &start);
         ATLC_CHECK_CUDA(cudaEventCreateWithFlags, &stop,
-                        options.blocking_event_sync ? cudaEventBlockingSync : cudaEventDefault);
+                        options.blocking_event_sync && !options.event_query ? cudaEventBlockingSync : cudaEventDefault);
         if (rank == 0)
             std::printf("iteration,buffer_a_bytes,buffer_b_bytes,copy_back,elapsed_ms\n");
         for (uint64_t iteration = 0; iteration < options.iterations; ++iteration) {
@@ -253,7 +261,7 @@ int main(int argc, char** argv) {
             ATLC_CHECK_CUDA(cudaEventRecord, start, stream);
             exchange(a, b, options, rank, comm, stream, pipeline);
             ATLC_CHECK_CUDA(cudaEventRecord, stop, stream);
-            ATLC_CHECK_CUDA(cudaEventSynchronize, stop);
+            ATLC_CHECK_CUDA(bench::wait_event, stop, options.event_query, options.query_yield);
             float elapsed_ms, max_ms = 0;
             ATLC_CHECK_CUDA(cudaEventElapsedTime, &elapsed_ms, start, stop);
             ATLC_CHECK_MPI(MPI_Reduce, &elapsed_ms, &max_ms, 1, MPI_FLOAT,

@@ -21,6 +21,19 @@ static uva_p2p::Options parse(std::vector<std::string> args) {
 int main() {
     const auto defaults = parse({"bench"});
     assert(defaults.blocking_stream_sync && defaults.blocking_event_sync);
+    assert(!defaults.stream_query && !defaults.event_query && !defaults.query_yield);
+    assert(parse({"bench", "--stream-query"}).stream_query);
+    assert(!parse({"bench", "--stream-query"}).event_query);
+    assert(parse({"bench", "--event-query"}).event_query);
+    assert(!parse({"bench", "--event-query"}).stream_query);
+    const auto polling = parse({"bench", "--stream-query", "--event-query", "--query-yield"});
+    assert(polling.stream_query && polling.event_query && polling.query_yield);
+    const auto reset = parse({"bench", "--stream-query", "--event-query", "--query-yield",
+                             "--no-stream-query", "--no-event-query", "--no-query-yield"});
+    assert(!reset.stream_query && !reset.event_query && !reset.query_yield);
+    for (const auto* flag : {"--stream-query", "--event-query", "--query-yield",
+                             "--no-stream-query", "--no-event-query", "--no-query-yield"})
+        rejects([&] { parse({"bench", std::string(flag) + "=1"}); });
     const auto stream_sync = parse({"bench", "--no-blocking-stream-sync"});
     assert(!stream_sync.blocking_stream_sync && stream_sync.blocking_event_sync);
     const auto event_sync = parse({"bench", "--no-blocking-event-sync"});

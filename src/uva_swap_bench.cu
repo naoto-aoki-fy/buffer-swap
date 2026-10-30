@@ -1,3 +1,4 @@
+#include "cuda_sync.hpp"
 #include <cuda_runtime.h>
 #include <curand.h>
 #include <curand_kernel.h>
@@ -21,6 +22,12 @@ static void usage() {
         "  -n, --iterations N      Timed swaps (default 128)\n"
         "      --no-blocking-stream-sync  Use default stream synchronization\n"
         "      --no-blocking-event-sync   Use default event synchronization\n"
+        "      --stream-query              Poll cudaStreamQuery instead of synchronizing\n"
+        "      --event-query               Poll cudaEventQuery instead of synchronizing\n"
+        "      --query-yield               Yield the host thread after each not-ready query\n"
+        "      --no-stream-query           Disable stream polling (default)\n"
+        "      --no-event-query            Disable event polling (default)\n"
+        "      --no-query-yield            Disable yielding while polling (default)\n"
         "      --validate          Compare all bytes after every swap; A <= 16M\n"
         "  -h, --help              Show this help on stderr\n"
         "SIZE accepts positive integers with optional binary K/M/G suffixes.\n"
@@ -37,7 +44,7 @@ __global__ void random_tail(unsigned char* tail, size_t count,
 }
 
 static void initialize(unsigned char* data, size_t bytes, cudaStream_t stream,
-                       unsigned long long seed) {
+                       unsigned long long seed, const uva_p2p::Options& options) {
     curandGenerator_t rng;
     ATLC_CHECK_CURAND(curandCreateGenerator, &rng, CURAND_RNG_PSEUDO_DEFAULT);
     ATLC_CHECK_CURAND(curandSetStream, rng, stream);
@@ -51,7 +58,7 @@ static void initialize(unsigned char* data, size_t bytes, cudaStream_t stream,
         random_tail<<<1, 1, 0, stream>>>(data + bytes - tail, tail, seed);
         ATLC_CHECK_CUDA(cudaGetLastError);
     }
-    ATLC_CHECK_CUDA(cudaStreamSynchronize, stream);
+    ATLC_CHECK_CUDA(bench::wait_stream, stream, options.stream_query, options.query_yield);
     ATLC_CHECK_CURAND(curandDestroyGenerator, rng);
 }
 
@@ -146,7 +153,7 @@ int main(int argc, char** argv) {
         ATLC_CHECK_CUDA(cudaDeviceCanAccessPeer, &accessible, 0, 1);
         if (!accessible)
             throw std::runtime_error("direct P2P access from GPU 0 to GPU 1 is unavailable");
-        if (options.blocking_stream_sync)
+        if (options.blocking_stream_sync && !options.stream_query)
             ATLC_CHECK_CUDA(cudaSetDeviceFlags, cudaDeviceScheduleBlockingSync);
         ATLC_CHECK_CUDA(cudaSetDevice, 0);
         ATLC_CHECK_CUDA(cudaDeviceEnablePeerAccess, 1, 0);
@@ -165,7 +172,7 @@ int main(int argc, char** argv) {
         cudaStream_t streams[2];
         std::vector<unsigned char> original[2], actual;
         for (int device = 0; device < 2; ++device) {
-            if (options.blocking_stream_sync)
+            if (options.blocking_stream_sync && !options.stream_query)
                 ATLC_CHECK_CUDA(cudaSetDeviceFlags, cudaDeviceScheduleBlockingSync);
             ATLC_CHECK_CUDA(cudaSetDevice, device);
             ATLC_CHECK_CUDA(cudaStreamCreate, &streams[device]);
@@ -175,7 +182,7 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("insufficient free GPU memory for A on GPU " +
                                          std::to_string(device));
             ATLC_CHECK_CUDA(cudaMalloc, reinterpret_cast<void**>(&a[device]), options.a_size);
-            initialize(a[device], options.a_size, streams[device], 1234ULL + device);
+            initialize(a[device], options.a_size, streams[device], 1234ULL + device, options);
             if (options.validate) {
                 original[device].resize(options.a_size);
                 ATLC_CHECK_CUDA(cudaMemcpy, original[device].data(), a[device],
@@ -185,19 +192,19 @@ int main(int argc, char** argv) {
         if (options.validate) actual.resize(options.a_size);
         ATLC_CHECK_CUDA(cudaSetDevice, 0);
         exchange(a[0], a[1], options, static_cast<unsigned>(grid), streams[0]);
-        ATLC_CHECK_CUDA(cudaStreamSynchronize, streams[0]);
+        ATLC_CHECK_CUDA(bench::wait_stream, streams[0], options.stream_query, options.query_yield);
         if (options.validate) validate(a, original, actual, true, "warm-up");
         cudaEvent_t start, stop;
         ATLC_CHECK_CUDA(cudaEventCreate, &start);
         ATLC_CHECK_CUDA(cudaEventCreateWithFlags, &stop,
-                        options.blocking_event_sync ? cudaEventBlockingSync : cudaEventDefault);
+                        options.blocking_event_sync && !options.event_query ? cudaEventBlockingSync : cudaEventDefault);
         if (std::printf("iteration,buffer_a_bytes,element_bytes,block_size,grid_size,elapsed_ms\n") < 0)
             throw std::runtime_error("failed to write CSV header");
         for (uint64_t iteration = 0; iteration < options.iterations; ++iteration) {
             ATLC_CHECK_CUDA(cudaEventRecord, start, streams[0]);
             exchange(a[0], a[1], options, static_cast<unsigned>(grid), streams[0]);
             ATLC_CHECK_CUDA(cudaEventRecord, stop, streams[0]);
-            ATLC_CHECK_CUDA(cudaEventSynchronize, stop);
+            ATLC_CHECK_CUDA(bench::wait_event, stop, options.event_query, options.query_yield);
             float elapsed_ms;
             ATLC_CHECK_CUDA(cudaEventElapsedTime, &elapsed_ms, start, stop);
             // One warm-up plus iteration+1 timed swaps: even iteration restores originals.

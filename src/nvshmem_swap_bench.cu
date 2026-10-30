@@ -1,3 +1,4 @@
+#include "cuda_sync.hpp"
 #include <cuda_runtime.h>
 #include <curand.h>
 #include <curand_kernel.h>
@@ -30,6 +31,12 @@ static void usage() {
         "      --method N          1: symmetric GET (default), 2: registered PUT, 3: staged GET\n"
         "      --no-blocking-stream-sync  Use default stream synchronization\n"
         "      --no-blocking-event-sync   Use default event synchronization\n"
+        "      --stream-query              Poll cudaStreamQuery instead of synchronizing\n"
+        "      --event-query               Poll cudaEventQuery instead of synchronizing\n"
+        "      --query-yield               Yield the host thread after each not-ready query\n"
+        "      --no-stream-query           Disable stream polling (default)\n"
+        "      --no-event-query            Disable event polling (default)\n"
+        "      --no-query-yield            Disable yielding while polling (default)\n"
         "      --validate          Verify warm-up and every swap; A <= 16M\n"
         "  -h, --help              Show help on stderr\n"
         "SIZE: positive integer with binary K/M/G suffix. Set NVSHMEM_SYMMETRIC_SIZE\n"
@@ -156,8 +163,9 @@ int main(int argc, char** argv) {
         const auto o = nvshmem_swap::parse_options(argc, argv);
         const uint64_t config[] = {o.a_size, o.chunk_size, o.element_bytes, o.block_size, o.sm_multiplier,
                                    o.iterations, uint64_t(o.validate), uint64_t(o.help), o.method,
-                                   uint64_t(o.blocking_stream_sync), uint64_t(o.blocking_event_sync)};
-        matching(config, 11);
+                                   uint64_t(o.blocking_stream_sync), uint64_t(o.blocking_event_sync),
+                                   uint64_t(o.stream_query), uint64_t(o.event_query), uint64_t(o.query_yield)};
+        matching(config, 14);
         if (o.help) {
             if (!rank) usage();
             ATLC_CHECK_MPI(MPI_Finalize);
@@ -182,7 +190,7 @@ int main(int argc, char** argv) {
         const int device = devices == 1 ? 0 : local_rank;
         if (device >= devices)
             throw std::runtime_error("not enough visible CUDA devices for local MPI ranks");
-        if (o.blocking_stream_sync)
+        if (o.blocking_stream_sync && !o.stream_query)
             ATLC_CHECK_CUDA(cudaSetDeviceFlags, cudaDeviceScheduleBlockingSync);
         ATLC_CHECK_CUDA(cudaSetDevice, device);
         cudaDeviceProp prop;
@@ -274,7 +282,7 @@ int main(int argc, char** argv) {
             random_tail<<<1, 1, 0, stream>>>(a + o.a_size - o.a_size % 4, o.a_size % 4, seed);
             ATLC_CHECK_CUDA(cudaGetLastError);
         }
-        ATLC_CHECK_CUDA(cudaStreamSynchronize, stream);
+        ATLC_CHECK_CUDA(bench::wait_stream, stream, o.stream_query, o.query_yield);
         ATLC_CHECK_CURAND(curandDestroyGenerator, rng);
         uint64_t a_bytes = o.a_size, chunk = l.chunk_bytes, generation = 0;
         int peer = 1 - rank;
@@ -314,12 +322,12 @@ int main(int argc, char** argv) {
         };
         ATLC_CHECK_MPI(MPI_Barrier, MPI_COMM_WORLD);
         exchange(); // Exactly one untimed full swap.
-        ATLC_CHECK_CUDA(cudaStreamSynchronize, stream);
+        ATLC_CHECK_CUDA(bench::wait_stream, stream, o.stream_query, o.query_yield);
         validate(true);
         cudaEvent_t start, stop;
         ATLC_CHECK_CUDA(cudaEventCreate, &start);
         ATLC_CHECK_CUDA(cudaEventCreateWithFlags, &stop,
-                        o.blocking_event_sync ? cudaEventBlockingSync : cudaEventDefault);
+                        o.blocking_event_sync && !o.event_query ? cudaEventBlockingSync : cudaEventDefault);
         if (!rank) std::printf("iteration,buffer_a_bytes,buffer_b_bytes,element_bytes,block_size,sm_multiplier,grid_blocks,chunk_bytes,elapsed_ms\n");
         for (uint64_t i = 0; i < o.iterations; ++i) {
             generation = (i + 1) * l.signal_generations;
@@ -327,7 +335,7 @@ int main(int argc, char** argv) {
             ATLC_CHECK_CUDA(cudaEventRecord, start, stream);
             exchange();
             ATLC_CHECK_CUDA(cudaEventRecord, stop, stream);
-            ATLC_CHECK_CUDA(cudaEventSynchronize, stop);
+            ATLC_CHECK_CUDA(bench::wait_event, stop, o.event_query, o.query_yield);
             float elapsed, maximum = 0;
             ATLC_CHECK_CUDA(cudaEventElapsedTime, &elapsed, start, stop);
             ATLC_CHECK_MPI(MPI_Reduce, &elapsed, &maximum, 1, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);

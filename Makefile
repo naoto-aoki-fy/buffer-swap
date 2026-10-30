@@ -13,25 +13,25 @@ NVSHMEM_SKEW_TEST_BIN ?= bin/nvshmem_swap_skew_test
 .PHONY: target
 target: $(NCCL_BENCH_BIN) $(UVA_BENCH_BIN) $(NVSHMEM_BENCH_BIN)
 
-$(NCCL_BENCH_BIN): src/nccl_swap_bench.cu include/bench_options.hpp
+$(NCCL_BENCH_BIN): src/nccl_swap_bench.cu include/bench_options.hpp include/cuda_sync.hpp
 	mkdir -p $(dir $@)
 	$(NVCC) $(NVCC_CFLAGS) $< $(NVCC_LDFLAGS) --cudart=shared -o $@
 
 # Test-only build: delay rank submissions and copies in the real NCCL exchange.
-$(NCCL_SKEW_TEST_BIN): tests/nccl_swap_skew_test.cu src/nccl_swap_bench.cu include/bench_options.hpp
+$(NCCL_SKEW_TEST_BIN): tests/nccl_swap_skew_test.cu src/nccl_swap_bench.cu include/bench_options.hpp include/cuda_sync.hpp
 	mkdir -p $(dir $@)
 	$(NVCC) $(NVCC_CFLAGS) $< $(NVCC_LDFLAGS) --cudart=shared -o $@
 
-$(UVA_BENCH_BIN): src/uva_swap_bench.cu include/uva_p2p_options.hpp include/bench_options.hpp
+$(UVA_BENCH_BIN): src/uva_swap_bench.cu include/uva_p2p_options.hpp include/bench_options.hpp include/cuda_sync.hpp
 	mkdir -p $(dir $@)
 	$(NVCC) $(NVCC_CFLAGS) $< $(NVCC_LDFLAGS) --cudart=shared -o $@
 
-$(NVSHMEM_BENCH_BIN): src/nvshmem_swap_bench.cu include/nvshmem_swap_options.hpp include/bench_options.hpp
+$(NVSHMEM_BENCH_BIN): src/nvshmem_swap_bench.cu include/nvshmem_swap_options.hpp include/bench_options.hpp include/cuda_sync.hpp
 	mkdir -p $(dir $@)
 	$(NVCC) -rdc=true $(NVCC_CFLAGS) $< $(NVCC_LDFLAGS) --cudart=shared -lnvshmem_host -lnvshmem_device -o $@
 
 # Test-only build: inject rank/block skew around the real kernel's NVSHMEM calls.
-$(NVSHMEM_SKEW_TEST_BIN): tests/nvshmem_swap_skew_test.cu src/nvshmem_swap_bench.cu include/nvshmem_swap_options.hpp include/bench_options.hpp
+$(NVSHMEM_SKEW_TEST_BIN): tests/nvshmem_swap_skew_test.cu src/nvshmem_swap_bench.cu include/nvshmem_swap_options.hpp include/bench_options.hpp include/cuda_sync.hpp
 	mkdir -p $(dir $@)
 	$(NVCC) -rdc=true $(NVCC_CFLAGS) $< $(NVCC_LDFLAGS) --cudart=shared -lnvshmem_host -lnvshmem_device -o $@
 

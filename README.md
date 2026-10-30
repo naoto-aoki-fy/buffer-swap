@@ -66,6 +66,22 @@ All three benchmarks enable blocking synchronization by default. Use
 `cudaEventBlockingSync`. The settings are independent, and all MPI ranks must
 use the same settings.
 
+Use `--stream-query` and/or `--event-query` to busy-poll `cudaStreamQuery`
+and/or `cudaEventQuery` instead of calling the corresponding synchronization
+API. These options override the corresponding blocking settings regardless of
+argument order. Stream polling applies to initialization and warm-up waits;
+event polling applies to the timed stop-event wait. Only `cudaErrorNotReady`
+retries; other CUDA errors are reported normally.
+
+Polling does not yield by default. Add `--query-yield` to call
+`std::this_thread::yield()` after each not-ready query in either loop.
+`--no-stream-query`, `--no-event-query`, and `--no-query-yield` disable the
+respective options; the last positive/negative flag wins. Yield has no effect
+when neither polling option is enabled. All MPI ranks must use the same settings.
+
+For example, append `--stream-query --event-query --query-yield` to any benchmark
+command to poll both kinds of completion with host-thread yielding.
+
 ## Options
 
 | Option | Meaning | Default |
@@ -78,6 +94,9 @@ use the same settings.
 | `--no-pipeline-copy-back` | Use all of B as one slot; serialize communication and B-to-A copies | Disabled |
 | `--no-blocking-stream-sync` | Use CUDA's default stream synchronization scheduling | Disabled |
 | `--no-blocking-event-sync` | Use CUDA's default stop-event synchronization | Disabled |
+| `--stream-query` / `--no-stream-query` | Enable/disable busy polling for stream completion | Disabled |
+| `--event-query` / `--no-event-query` | Enable/disable busy polling for stop-event completion | Disabled |
+| `--query-yield` / `--no-query-yield` | Enable/disable host-thread yielding after a not-ready query | Disabled |
 | `--validate` | Compare every byte of A after warm-up and each timed iteration | Disabled |
 | `-h`, `--help` | Print help to stderr and exit | |
 
@@ -409,6 +428,9 @@ Launch directly, without a multi-process launcher:
 | `-n`, `--iterations N` | Timed complete swaps | `128` |
 | `--no-blocking-stream-sync` | Use CUDA's default stream synchronization scheduling | Disabled |
 | `--no-blocking-event-sync` | Use CUDA's default stop-event synchronization | Disabled |
+| `--stream-query` / `--no-stream-query` | Enable/disable busy polling for stream completion | Disabled |
+| `--event-query` / `--no-event-query` | Enable/disable busy polling for stop-event completion | Disabled |
+| `--query-yield` / `--no-query-yield` | Enable/disable host-thread yielding after a not-ready query | Disabled |
 | `--validate` | Compare both buffers after warm-up and every timed swap | Disabled |
 | `-h`, `--help` | Print help to stderr without accessing CUDA | |
 
@@ -574,6 +596,9 @@ See NVIDIA's [NVSHMEM compilation and MPI interoperability guide](https://docs.n
 | `--method N` | 1: symmetric GET, 2: registered PUT, 3: staged GET | `1` |
 | `--no-blocking-stream-sync` | Use CUDA's default stream synchronization scheduling | Disabled |
 | `--no-blocking-event-sync` | Use CUDA's default stop-event synchronization | Disabled |
+| `--stream-query` / `--no-stream-query` | Enable/disable busy polling for stream completion | Disabled |
+| `--event-query` / `--no-event-query` | Enable/disable busy polling for stop-event completion | Disabled |
+| `--query-yield` / `--no-query-yield` | Enable/disable host-thread yielding after a not-ready query | Disabled |
 | `--validate` | Verify warm-up and every timed swap, both ranks | Disabled |
 | `-h`, `--help` | Usage on stderr, without CUDA/NVSHMEM initialization | |
 

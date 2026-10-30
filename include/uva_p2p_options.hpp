@@ -16,6 +16,7 @@ struct Options {
     bool validate = false;
     bool help = false;
     bool blocking_stream_sync = true, blocking_event_sync = true;
+    bool stream_query = false, event_query = false, query_yield = false;
 };
 
 inline Options parse_options(int argc, char** argv) {
@@ -32,6 +33,12 @@ inline Options parse_options(int argc, char** argv) {
         {"blocking-event-sync", no_argument, nullptr, 259},
         {"no-blocking-stream-sync", no_argument, nullptr, 260},
         {"no-blocking-event-sync", no_argument, nullptr, 261},
+        {"stream-query", no_argument, nullptr, 264},
+        {"event-query", no_argument, nullptr, 265},
+        {"query-yield", no_argument, nullptr, 266},
+        {"no-stream-query", no_argument, nullptr, 267},
+        {"no-event-query", no_argument, nullptr, 268},
+        {"no-query-yield", no_argument, nullptr, 269},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
@@ -50,6 +57,12 @@ inline Options parse_options(int argc, char** argv) {
             case 259: result.blocking_event_sync = true; break;
             case 260: result.blocking_stream_sync = false; break;
             case 261: result.blocking_event_sync = false; break;
+            case 264: result.stream_query = true; break;
+            case 265: result.event_query = true; break;
+            case 266: result.query_yield = true; break;
+            case 267: result.stream_query = false; break;
+            case 268: result.event_query = false; break;
+            case 269: result.query_yield = false; break;
             case 'h': result.help = true; break;
             default: throw std::invalid_argument("unknown option or missing option argument");
         }
